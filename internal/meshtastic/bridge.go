@@ -208,8 +208,12 @@ func (b *Bridge) FormatSenderLabel(nodeID uint32) string {
 func (b *Bridge) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 
+	txQueues := make([]transportTxQueue, 0, len(b.transports))
 	for _, tr := range b.transports {
 		t := tr
+		if t == nil {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -217,12 +221,17 @@ func (b *Bridge) Run(ctx context.Context) {
 				b.logger.Errorf("meshtastic %s stopped: %v", t.Name(), err)
 			}
 		}()
+
+		txq := make(chan *MeshPacket, meshTxQueueCap)
+		txQueues = append(txQueues, transportTxQueue{name: t.Name(), ch: txq})
+		wg.Add(1)
+		go b.runTransportTxWorker(ctx, &wg, t, txq)
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		b.runTxLoop(ctx)
+		b.runTxLoop(ctx, txQueues)
 	}()
 
 	if b.cfg.NodeInfoInterval > 0 {
@@ -256,7 +265,32 @@ func (b *Bridge) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-func (b *Bridge) runTxLoop(ctx context.Context) {
+type transportTxQueue struct {
+	name string
+	ch   chan *MeshPacket
+}
+
+func (b *Bridge) runTransportTxWorker(ctx context.Context, wg *sync.WaitGroup, tr Transport, txq <-chan *MeshPacket) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pkt := <-txq:
+			if pkt == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err := tr.Send(ctx, pkt); err != nil && ctx.Err() == nil && b.logger != nil {
+				b.logger.Warnf("meshtastic %s send id=0x%08x failed: %v", tr.Name(), pkt.ID, err)
+			}
+		}
+	}
+}
+
+func (b *Bridge) runTxLoop(ctx context.Context, txQueues []transportTxQueue) {
 	var lastSend time.Time
 	for {
 		var pkt *MeshPacket
@@ -278,9 +312,18 @@ func (b *Bridge) runTxLoop(ctx context.Context) {
 				}
 			}
 		}
-		for _, tr := range b.transports {
-			if err := tr.Send(ctx, pkt); err != nil && b.logger != nil {
-				b.logger.Warnf("meshtastic %s send id=0x%08x failed: %v", tr.Name(), pkt.ID, err)
+		if ctx.Err() != nil {
+			return
+		}
+		// Dispatch independently per transport so a slow or stalled MQTT write
+		// never delays local UDP multicast (or vice versa).
+		for _, q := range txQueues {
+			select {
+			case q.ch <- pkt:
+			default:
+				if b.logger != nil {
+					b.logger.Warnf("meshtastic %s outbound queue full (%d); dropping packet 0x%08x", q.name, cap(q.ch), pkt.ID)
+				}
 			}
 		}
 		lastSend = b.now()

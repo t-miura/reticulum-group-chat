@@ -15,6 +15,8 @@ import (
 // DefaultUDPAddr is Meshtastic's standard LAN multicast address and port.
 const DefaultUDPAddr = "239.0.0.69:4403"
 
+const udpMulticastTTL = 64
+
 // UDPTransport sends and receives raw Meshtastic MeshPacket protobuf datagrams
 // over UDP multicast (or unicast UDP in tests).
 type UDPTransport struct {
@@ -196,7 +198,9 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, []net.Pack
 		return nil, nil, nil, nil, fmt.Errorf("meshtastic udp open sender: %w", err)
 	}
 	if isMulticast {
-		configureMulticastSender(sendConn, primaryIP)
+		if cerr := configureMulticastSender(sendConn, primaryIP); cerr != nil && u.logger != nil {
+			u.logger.Warnf("meshtastic udp configure multicast sender (%v): %v", primaryIP, cerr)
+		}
 	}
 
 	var extraSendConns []net.PacketConn
@@ -222,7 +226,9 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, []net.Pack
 				}
 				continue
 			}
-			configureMulticastSender(ec, ip)
+			if cerr := configureMulticastSender(ec, ip); cerr != nil && u.logger != nil {
+				u.logger.Debugf("meshtastic udp configure extra multicast sender on %s (%v): %v", allIFs[i].Name, ip, cerr)
+			}
 			extraSendConns = append(extraSendConns, ec)
 			extraNames = append(extraNames, fmt.Sprintf("%s(%v)", allIFs[i].Name, ip))
 			seenIPs[key] = struct{}{}
@@ -263,9 +269,14 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, []net.Pack
 }
 
 // Send marshals pkt and writes it to the configured UDP destination.
-func (u *UDPTransport) Send(_ context.Context, pkt *MeshPacket) error {
+func (u *UDPTransport) Send(ctx context.Context, pkt *MeshPacket) error {
 	if pkt == nil {
 		return nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	u.mu.Lock()
 	sendConn := u.sendConn

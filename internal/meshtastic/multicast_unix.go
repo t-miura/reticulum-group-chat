@@ -32,17 +32,30 @@ func joinMulticastGroup(conn *net.UDPConn, ifi *net.Interface, groupIP net.IP) e
 	return sockErr
 }
 
-func configureMulticastSender(conn *net.UDPConn, ifIP net.IP) {
+func configureMulticastSender(conn *net.UDPConn, ifIP net.IP) error {
 	rc, err := conn.SyscallConn()
 	if err != nil {
-		return
+		return err
 	}
-	_ = rc.Control(func(fd uintptr) {
-		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_LOOP, 1)
+	var firstErr error
+	if err := rc.Control(func(fd uintptr) {
+		// Match Meshtastic firmware's multicast TTL (64) instead of OS default 1
+		// so LAN routers, bridges, or wireless APs do not drop packets at hop 1.
+		if serr := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, udpMulticastTTL); serr != nil {
+			firstErr = serr
+		}
+		if serr := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_LOOP, 1); serr != nil && firstErr == nil {
+			firstErr = serr
+		}
 		if ip4 := ifIP.To4(); ip4 != nil {
 			var addr [4]byte
 			copy(addr[:], ip4)
-			_ = syscall.SetsockoptInet4Addr(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, addr)
+			if serr := syscall.SetsockoptInet4Addr(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, addr); serr != nil && firstErr == nil {
+				firstErr = serr
+			}
 		}
-	})
+	}); err != nil {
+		return err
+	}
+	return firstErr
 }

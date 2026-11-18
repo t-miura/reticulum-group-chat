@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -524,5 +525,214 @@ func TestBridgeRejectsPlaintextOnEncryptedAndCorruptDoesNotPoisonDedup(t *testin
 	defer gotMu.Unlock()
 	if len(got) != 1 || got[0].Text != "authentic" {
 		t.Fatalf("got = %+v, want single authentic message", got)
+	}
+}
+
+type blockingMeshTransport struct {
+	name    string
+	started chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (b *blockingMeshTransport) Name() string { return b.name }
+
+func (b *blockingMeshTransport) Run(ctx context.Context, _ func(*MeshPacket)) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (b *blockingMeshTransport) Send(ctx context.Context, _ *MeshPacket) error {
+	b.once.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type signalMeshTransport struct {
+	name   string
+	sentCh chan *MeshPacket
+}
+
+func (s *signalMeshTransport) Name() string { return s.name }
+
+func (s *signalMeshTransport) Run(ctx context.Context, _ func(*MeshPacket)) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (s *signalMeshTransport) Send(_ context.Context, pkt *MeshPacket) error {
+	s.sentCh <- pkt
+	return nil
+}
+
+func TestBridgeSlowTransportDoesNotStallOtherTransport(t *testing.T) {
+	b, err := NewBridge(BridgeConfig{
+		ChannelName:  "LongFast",
+		BridgeNodeID: 0xaabbccdd,
+		ShortName:    "RNS",
+		LongName:     "Test",
+	}, nil, logging.Discard())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slowMQTT := &blockingMeshTransport{
+		name:    "mqtt",
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	fastUDP := &signalMeshTransport{
+		name:   "udp",
+		sentCh: make(chan *MeshPacket, 8),
+	}
+	// Place slowMQTT before fastUDP to verify head-of-line isolation regardless of order.
+	b.SetTransports(slowMQTT, fastUDP)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.Run(ctx)
+	}()
+
+	ids1 := b.SendText("first", 0)
+	ids2 := b.SendText("second", 0)
+	if len(ids1) != 1 || len(ids2) != 1 {
+		t.Fatalf("unexpected SendText ids: %v %v", ids1, ids2)
+	}
+
+	select {
+	case <-slowMQTT.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow transport never received first send")
+	}
+
+	for i, wantID := range []uint32{ids1[0], ids2[0]} {
+		select {
+		case pkt := <-fastUDP.sentCh:
+			if pkt.ID != wantID {
+				t.Errorf("udp pkt[%d] id = 0x%08x, want 0x%08x", i, pkt.ID, wantID)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("udp transport stalled waiting for slow mqtt transport (pkt %d)", i)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		close(slowMQTT.release)
+		t.Fatal("Bridge.Run did not exit promptly after context cancel")
+	}
+}
+
+type stallWriteConn struct {
+	net.Conn
+	stall       atomic.Bool
+	writePaused chan struct{}
+	pausedOnce  sync.Once
+	closed      chan struct{}
+	closeOnce   sync.Once
+}
+
+func (c *stallWriteConn) Write(p []byte) (int, error) {
+	if c.stall.Load() {
+		c.pausedOnce.Do(func() { close(c.writePaused) })
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *stallWriteConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func TestMQTTTransportCloseDoesNotDeadlockBehindHungWrite(t *testing.T) {
+	rawClient, serverConn := net.Pipe()
+	clientConn := &stallWriteConn{
+		Conn:        rawClient,
+		writePaused: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+	defer serverConn.Close()
+
+	go func() {
+		defer serverConn.Close()
+		br := bufio.NewReader(serverConn)
+		ptype, _, _, rerr := readMQTTPacket(br)
+		if rerr != nil || ptype != 1 {
+			return
+		}
+		_, _ = serverConn.Write([]byte{0x20, 0x02, 0x00, 0x00}) // CONNACK
+		ptype, _, body, rerr := readMQTTPacket(br)
+		if rerr != nil || ptype != 8 || len(body) < 2 {
+			return
+		}
+		pid := binary.BigEndian.Uint16(body[:2])
+		_, _ = serverConn.Write([]byte{0x90, 0x03, byte(pid >> 8), byte(pid), 0x00}) // SUBACK
+		_, _, _, _ = readMQTTPacket(br)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mq := NewMQTTTransport("tcp://mock.broker:1883", "", "", "msh/JP", "JPCHAT", "aabbccdd", logging.Discard())
+	mq.dialFn = func(context.Context, string) (net.Conn, error) {
+		return clientConn, nil
+	}
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = mq.Run(ctx, nil)
+	}()
+
+	select {
+	case <-mq.Ready():
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("MQTTTransport did not reach subscribed state")
+	}
+
+	clientConn.stall.Store(true)
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- mq.Send(ctx, &MeshPacket{
+			From:    0xaabbccdd,
+			To:      BroadcastAddr,
+			Channel: 8,
+			ID:      0x12345678,
+			Decoded: &Data{Portnum: PortNumTextMessageApp, Payload: []byte("blocked")},
+		})
+	}()
+
+	select {
+	case <-clientConn.writePaused:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("MQTT Send did not enter Write")
+	}
+
+	// Canceling ctx must immediately close conn without deadlocking behind writeMu.
+	cancel()
+
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatal("expected error from interrupted MQTT Send")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("MQTT Send remained blocked after context cancel")
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("MQTTTransport.Run remained blocked after context cancel")
 	}
 }

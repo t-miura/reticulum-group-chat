@@ -20,6 +20,7 @@ import (
 const (
 	mqttKeepAliveSecs = 60
 	mqttDialTimeout   = 15 * time.Second
+	mqttWriteTimeout  = 3 * time.Second
 	mqttMaxPacketSize = 1024 * 1024
 )
 
@@ -146,11 +147,12 @@ func (m *MQTTTransport) runSession(ctx context.Context, onPacket func(*MeshPacke
 
 	go func() {
 		<-sessionCtx.Done()
-		// Best-effort DISCONNECT before closing socket.
-		m.writeMu.Lock()
-		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-		_, _ = conn.Write([]byte{0xE0, 0x00})
-		m.writeMu.Unlock()
+		// Best-effort DISCONNECT without blocking socket Close behind a hung writer.
+		if m.writeMu.TryLock() {
+			_ = conn.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+			_, _ = conn.Write([]byte{0xE0, 0x00})
+			m.writeMu.Unlock()
+		}
 		_ = conn.Close()
 	}()
 
@@ -267,9 +269,14 @@ func (m *MQTTTransport) runSession(ctx context.Context, onPacket func(*MeshPacke
 }
 
 // Send wraps pkt in a ServiceEnvelope and publishes it with QoS 0 to PubTopic().
-func (m *MQTTTransport) Send(_ context.Context, pkt *MeshPacket) error {
+func (m *MQTTTransport) Send(ctx context.Context, pkt *MeshPacket) error {
 	if pkt == nil {
 		return nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	m.mu.Lock()
 	conn := m.conn
@@ -304,7 +311,7 @@ func (m *MQTTTransport) Send(_ context.Context, pkt *MeshPacket) error {
 func (m *MQTTTransport) writeRaw(conn net.Conn, data []byte) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(mqttWriteTimeout))
 	_, err := conn.Write(data)
 	return err
 }
