@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/meshtastic"
 )
 
 // validServiceConfig is the minimum ServiceConfig that passes normalize();
@@ -559,5 +560,84 @@ func TestLogLevel(t *testing.T) {
 		if len(cfg.Warnings) != 0 {
 			t.Errorf("log_level %q under [service] warned: %q", c.in, cfg.Warnings)
 		}
+	}
+}
+
+func TestMeshtasticConfigLoadAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	url := meshtastic.FormatChannelURL("MeshGroup", []byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	})
+	path := filepath.Join(dir, "mesh.toml")
+	body := "[service]\ndisplay_name = \"Bay Bridge\"\n" +
+		"[meshtastic]\nenabled = true\nchannel_url = \"" + url + "\"\n" +
+		"node_id = \"!1234abcd\"\nshort_name = \"BAY\"\n" +
+		"[meshtastic.udp]\nenabled = true\n" +
+		"[meshtastic.mqtt]\nenabled = true\nbroker = \"tcp://mqtt.example.org:1883\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", cfg.Warnings)
+	}
+	if cfg.Meshtastic.ChannelName != "MeshGroup" {
+		t.Errorf("ChannelName = %q, want MeshGroup", cfg.Meshtastic.ChannelName)
+	}
+	if len(cfg.Meshtastic.ExpandedKey) != 16 || cfg.Meshtastic.ExpandedKey[0] != 0x01 {
+		t.Errorf("ExpandedKey = %x, want 16-byte URL key", cfg.Meshtastic.ExpandedKey)
+	}
+	if cfg.Meshtastic.BridgeNodeID != 0x1234abcd {
+		t.Errorf("BridgeNodeID = 0x%08x, want 0x1234abcd", cfg.Meshtastic.BridgeNodeID)
+	}
+	if cfg.Meshtastic.LongName != "Bay Bridge" {
+		t.Errorf("LongName = %q, want display_name fallback", cfg.Meshtastic.LongName)
+	}
+
+	// Enabled without transport must fail.
+	bad := filepath.Join(dir, "bad.toml")
+	if err := os.WriteFile(bad, []byte("[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nchannel_name = \"LongFast\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(bad); err == nil {
+		t.Error("expected error when meshtastic.enabled = true with no UDP or MQTT enabled")
+	}
+
+	// short_name > 4 bytes must fail.
+	badShort := filepath.Join(dir, "short.toml")
+	if err := os.WriteFile(badShort, []byte("[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nchannel_name = \"LongFast\"\nshort_name = \"TOOLONG\"\n[meshtastic.udp]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(badShort); err == nil {
+		t.Error("expected error for short_name > 4 bytes")
+	}
+
+	// Wildcard/slash in channel_name or wildcard in root_topic must fail.
+	for _, tomlSnippet := range []string{
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nchannel_name = \"Bad/Chan\"\n[meshtastic.udp]\nenabled = true\n",
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nchannel_name = \"Bad+Chan\"\n[meshtastic.udp]\nenabled = true\n",
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nchannel_name = \"LongFast\"\n[meshtastic.mqtt]\nenabled = true\nbroker = \"tcp://b:1883\"\nroot_topic = \"msh/#\"\n",
+	} {
+		p := filepath.Join(dir, "wild.toml")
+		if err := os.WriteFile(p, []byte(tomlSnippet), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Errorf("expected wildcard validation error for:\n%s", tomlSnippet)
+		}
+	}
+}
+
+func TestLoadExampleConfigNoWarnings(t *testing.T) {
+	c, err := Load(filepath.Join("..", "..", "configs", "fwdsvc.example.toml"))
+	if err != nil {
+		t.Fatalf("Load example config: %v", err)
+	}
+	if len(c.Warnings) != 0 {
+		t.Errorf("example config emitted warnings: %q", c.Warnings)
 	}
 }

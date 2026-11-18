@@ -137,3 +137,71 @@ func TestViewForReturnsOkFalseForUnknownRecipient(t *testing.T) {
 		t.Error("ViewFor(bob) ok=true, want false (bob wasn't a fan-out target)")
 	}
 }
+
+func TestMeshIDRegisterLookupAndPrimary(t *testing.T) {
+	c := New(time.Hour, 100)
+	b := NewBubble(time.Hour, time.Now())
+
+	if _, ok := b.PrimaryMeshID(); ok {
+		t.Error("PrimaryMeshID on empty bubble = true, want false")
+	}
+
+	b.SetPreview("[alice] hello mesh")
+	if got := b.Preview(); got != "[alice] hello mesh" {
+		t.Errorf("Preview = %q, want %q", got, "[alice] hello mesh")
+	}
+
+	c.RegisterMeshID(b, 101)
+	c.RegisterMeshID(b, 102)
+	c.RegisterMeshID(b, 101) // duplicate id is idempotent
+
+	if c.MeshLen() != 2 {
+		t.Errorf("MeshLen = %d, want 2", c.MeshLen())
+	}
+	if id, ok := b.PrimaryMeshID(); !ok || id != 101 {
+		t.Errorf("PrimaryMeshID = (%d, %v), want (101, true)", id, ok)
+	}
+	if got := c.LookupMeshID(101); got != b {
+		t.Errorf("LookupMeshID(101) = %v, want bubble", got)
+	}
+	if got := c.LookupMeshID(102); got != b {
+		t.Errorf("LookupMeshID(102) = %v, want bubble", got)
+	}
+	if got := c.LookupMeshID(0); got != nil {
+		t.Errorf("LookupMeshID(0) = %v, want nil", got)
+	}
+}
+
+func TestMeshIDEvictionByTTLAndLRU(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	c := New(50*time.Millisecond, 2)
+	c.now = func() time.Time { return now }
+
+	b1 := NewBubble(50*time.Millisecond, now)
+	b2 := NewBubble(50*time.Millisecond, now)
+	b3 := NewBubble(50*time.Millisecond, now)
+
+	c.RegisterMeshID(b1, 1)
+	c.RegisterMeshID(b2, 2)
+	// Inserting b3 overflows cap=2 and evicts b1.
+	c.RegisterMeshID(b3, 3)
+
+	if c.LookupMeshID(1) != nil {
+		t.Error("b1 mesh ID should be evicted by LRU cap")
+	}
+	if c.LookupMeshID(2) != b2 || c.LookupMeshID(3) != b3 {
+		t.Error("b2 and b3 should remain in cache")
+	}
+
+	// Past TTL evicts b2 and b3.
+	c.now = func() time.Time { return now.Add(60 * time.Millisecond) }
+	if c.LookupMeshID(2) != nil {
+		t.Error("b2 should be expired")
+	}
+	if c.LookupMeshID(3) != nil {
+		t.Error("b3 should be expired")
+	}
+	if c.MeshLen() != 0 {
+		t.Errorf("MeshLen after expiry = %d, want 0", c.MeshLen())
+	}
+}

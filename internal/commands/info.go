@@ -52,6 +52,10 @@ func (d *Dispatcher) renderInfo(c *Caller, info string, pins int) string {
 		b.WriteString("\nNo description set.")
 	}
 
+	if d.Cfg != nil && d.Cfg.Meshtastic.Enabled && d.Cfg.Meshtastic.ExposeInInfo && d.Cfg.Meshtastic.ChannelName != "" {
+		fmt.Fprintf(&b, "\nMeshtastic: #%s (/mesh)", d.Cfg.Meshtastic.ChannelName)
+	}
+
 	switch {
 	case c.Member:
 		if pins > 0 {

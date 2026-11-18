@@ -347,3 +347,16 @@ func TestSetInfoWithNoRoomLeft(t *testing.T) {
 		t.Errorf("/setinfo with an overfull display name = %q, want a pointer at display_name", got)
 	}
 }
+
+func TestInfoShowsBridgedMeshtasticChannel(t *testing.T) {
+	d := newInfoDispatcher(t)
+	d.Cfg.Meshtastic = config.MeshtasticConfig{
+		Enabled:      true,
+		ExposeInInfo: true,
+		ChannelName:  "BayMesh",
+	}
+	got := d.Dispatch(userHash, Parse("/info"))
+	if !strings.Contains(got, "Meshtastic: #BayMesh (/mesh)") {
+		t.Errorf("/info missing Meshtastic line: %q", got)
+	}
+}

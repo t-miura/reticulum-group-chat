@@ -40,10 +40,21 @@ import (
 // after fan-out add no new views, but a slow late Send (queued behind
 // other recipients) may still register its view here.
 type Bubble struct {
+	mu sync.RWMutex
+
 	// views maps a recipient's destination_hash (hex, lowercase) to
 	// the LXMF message_id (hex, lowercase) that recipient will compute
 	// when they parse the body we sent them.
 	views map[string]string
+
+	// meshIDs records the Meshtastic packet_id(s) associated with this
+	// bubble. Index 0 is the primary packet_id that Meshtastic replies
+	// and tap-back reactions target.
+	meshIDs []uint32
+
+	// preview holds an optional short UTF-8 preview of the bubble's
+	// text so Meshtastic replies can populate LXMF FIELD_REPLY_QUOTE.
+	preview string
 
 	expiresAt time.Time
 
@@ -68,26 +79,57 @@ func NewBubble(ttl time.Duration, now time.Time) *Bubble {
 // return is false — the caller should skip the rewrite (or skip the
 // recipient entirely, depending on its semantics).
 func (b *Bubble) ViewFor(recipientHex string) (msgIDHex string, ok bool) {
+	b.mu.RLock()
 	v, ok := b.views[recipientHex]
+	b.mu.RUnlock()
 	return v, ok
 }
 
+// PrimaryMeshID returns the primary Meshtastic packet_id registered for
+// this bubble, or (0, false) if none has been registered.
+func (b *Bubble) PrimaryMeshID() (uint32, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if len(b.meshIDs) == 0 {
+		return 0, false
+	}
+	return b.meshIDs[0], true
+}
+
+// SetPreview records a short text preview for this bubble (used for
+// FIELD_REPLY_QUOTE when a Meshtastic peer replies to the bubble).
+func (b *Bubble) SetPreview(s string) {
+	b.mu.Lock()
+	b.preview = s
+	b.mu.Unlock()
+}
+
+// Preview returns the stored short text preview for this bubble, or "".
+func (b *Bubble) Preview() string {
+	b.mu.RLock()
+	s := b.preview
+	b.mu.RUnlock()
+	return s
+}
+
 // Cache is an LRU+TTL store: every Bubble lives under each of its
-// registered recipient-view message_ids, evicted whichever-first by
-// expiry or hard size cap. The zero value is not usable — call New.
+// registered recipient-view message_ids and Meshtastic packet_ids,
+// evicted whichever-first by expiry or hard size cap. The zero value is
+// not usable — call New.
 type Cache struct {
 	ttl     time.Duration
 	maxSize int
 
-	mu        sync.Mutex
-	byMsgID   map[string]*Bubble // msg_id_hex (any recipient's view) → bubble
-	lru       *list.List         // front = newest; back = oldest
-	now       func() time.Time
+	mu       sync.Mutex
+	byMsgID  map[string]*Bubble // msg_id_hex (any recipient's view) → bubble
+	byMeshID map[uint32]*Bubble // Meshtastic packet_id → bubble
+	lru      *list.List         // front = newest; back = oldest
+	now      func() time.Time
 }
 
 // New returns a Cache with the given TTL and maximum entry count.
 //
-// maxSize counts ENTRIES (distinct msg_id keys), not bubbles —
+// maxSize counts ENTRIES (distinct msg_id + packet_id keys), not bubbles —
 // fan-out to 64 recipients creates 64 entries pointing at one bubble.
 // Set maxSize so it can hold (typical roster size) × (expected per-TTL
 // message rate). 0 disables the cap (only TTL evicts); negative is
@@ -100,11 +142,12 @@ func New(ttl time.Duration, maxSize int) *Cache {
 		maxSize = 0
 	}
 	return &Cache{
-		ttl:     ttl,
-		maxSize: maxSize,
-		byMsgID: make(map[string]*Bubble),
-		lru:     list.New(),
-		now:     time.Now,
+		ttl:      ttl,
+		maxSize:  maxSize,
+		byMsgID:  make(map[string]*Bubble),
+		byMeshID: make(map[uint32]*Bubble),
+		lru:      list.New(),
+		now:      time.Now,
 	}
 }
 
@@ -123,8 +166,46 @@ func (c *Cache) RegisterView(b *Bubble, recipientHex, msgIDHex string) {
 
 	c.evictExpiredLocked()
 
+	b.mu.Lock()
 	b.views[recipientHex] = msgIDHex
+	b.mu.Unlock()
 	c.byMsgID[msgIDHex] = b
+
+	if b.lru == nil {
+		b.lru = c.lru.PushFront(b)
+	} else {
+		c.lru.MoveToFront(b.lru)
+	}
+
+	c.enforceCapLocked()
+}
+
+// RegisterMeshID indexes b under a Meshtastic packet_id so replies and
+// tap-back reactions from Meshtastic (or targeting a Meshtastic-bridged
+// message) can resolve the shared Bubble. No-op when b is nil or
+// packetID is 0.
+func (c *Cache) RegisterMeshID(b *Bubble, packetID uint32) {
+	if b == nil || packetID == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.evictExpiredLocked()
+
+	b.mu.Lock()
+	seen := false
+	for _, id := range b.meshIDs {
+		if id == packetID {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		b.meshIDs = append(b.meshIDs, packetID)
+	}
+	b.mu.Unlock()
+	c.byMeshID[packetID] = b
 
 	if b.lru == nil {
 		b.lru = c.lru.PushFront(b)
@@ -157,12 +238,42 @@ func (c *Cache) Lookup(msgIDHex string) *Bubble {
 	return b
 }
 
+// LookupMeshID returns the bubble registered under packetID, or nil if
+// no entry exists or the entry has expired. Reads touch the LRU.
+func (c *Cache) LookupMeshID(packetID uint32) *Bubble {
+	if packetID == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	b, ok := c.byMeshID[packetID]
+	if !ok {
+		return nil
+	}
+	if c.now().After(b.expiresAt) {
+		c.removeBubbleLocked(b)
+		return nil
+	}
+	if b.lru != nil {
+		c.lru.MoveToFront(b.lru)
+	}
+	return b
+}
+
 // Len returns the current number of indexed message_id keys. Sum of
 // (views per bubble) across all live bubbles; not the bubble count.
 func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.byMsgID)
+}
+
+// MeshLen returns the current number of indexed Meshtastic packet_ids.
+func (c *Cache) MeshLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.byMeshID)
 }
 
 // evictExpiredLocked walks the LRU from oldest to newest and drops
@@ -183,13 +294,13 @@ func (c *Cache) evictExpiredLocked() {
 	}
 }
 
-// enforceCapLocked drops oldest bubbles until len(byMsgID) <= maxSize.
+// enforceCapLocked drops oldest bubbles until total indexed keys <= maxSize.
 // No-op when maxSize == 0.
 func (c *Cache) enforceCapLocked() {
 	if c.maxSize <= 0 {
 		return
 	}
-	for len(c.byMsgID) > c.maxSize {
+	for len(c.byMsgID)+len(c.byMeshID) > c.maxSize {
 		el := c.lru.Back()
 		if el == nil {
 			return
@@ -201,9 +312,14 @@ func (c *Cache) enforceCapLocked() {
 // removeBubbleLocked unlinks a bubble from every map key + the LRU.
 // Caller holds c.mu.
 func (c *Cache) removeBubbleLocked(b *Bubble) {
+	b.mu.RLock()
 	for _, msgID := range b.views {
 		delete(c.byMsgID, msgID)
 	}
+	for _, meshID := range b.meshIDs {
+		delete(c.byMeshID, meshID)
+	}
+	b.mu.RUnlock()
 	if b.lru != nil {
 		c.lru.Remove(b.lru)
 		b.lru = nil

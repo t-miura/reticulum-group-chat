@@ -265,18 +265,23 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		s.logger.Debugf("reaction relay: stamped originator source_hash=%s", senderHex)
 	}
 
+	if opts.bubble != nil && body != "" {
+		opts.bubble.SetPreview(truncatePreview(body, 100))
+	}
+
 	// Delivery.Send routes opportunistic vs link automatically based on
 	// payload size, so we no longer need a pre-flight size check or the
 	// "message too large" reply path. The MaxInboundChars policy cap
 	// above (s.cfg.Service.MaxInboundChars) is the only ceiling on
 	// content length that's still enforced here.
 	delivered := s.forwardToRoster(senderHex, body, fwdFields, opts)
+	meshDelivered := s.forwardToMeshtastic(content, senderNick, body, fwdFields, opts.bubble)
 
 	// Reactions and bare reply-to messages have no visible text — keep
 	// them out of the replay buffer so a freshly-joining member doesn't
 	// see a bunch of orphan "" bubbles without the original messages
 	// they refer to.
-	if delivered > 0 && content != "" {
+	if (delivered > 0 || meshDelivered) && content != "" {
 		_ = s.history.Append(history.Entry{
 			At:         now,
 			SenderHash: senderHex,

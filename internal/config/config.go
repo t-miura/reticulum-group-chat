@@ -14,6 +14,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/meshtastic"
 )
 
 const identityHashLen = 16
@@ -29,6 +30,7 @@ type Config struct {
 	Interfaces  []InterfaceConfig `toml:"interfaces"`
 	Replay      ReplayConfig      `toml:"replay"`
 	Propagation PropagationConfig `toml:"propagation"`
+	Meshtastic  MeshtasticConfig  `toml:"meshtastic"`
 	Admins      []string          `toml:"admins"`
 	Mods        []string          `toml:"mods"`
 
@@ -353,6 +355,48 @@ type ReplayConfig struct {
 	PinsOnJoin bool `toml:"pins_on_join"`
 }
 
+// MeshtasticConfig configures the optional bidirectional Meshtastic channel bridge.
+type MeshtasticConfig struct {
+	Enabled          bool                 `toml:"enabled"`
+	ChannelURL       string               `toml:"channel_url"`
+	ChannelName      string               `toml:"channel_name"`
+	PSK              string               `toml:"psk"`
+	NodeID           string               `toml:"node_id"`
+	ShortName        string               `toml:"short_name"`
+	LongName         string               `toml:"long_name"`
+	NodeInfoInterval Duration             `toml:"nodeinfo_interval"`
+	HopLimit         int                  `toml:"hop_limit"`
+	OKToMQTT         bool                 `toml:"ok_to_mqtt"`
+	NameFormat       string               `toml:"name_format"`
+	LongMessageMode  string               `toml:"long_message_mode"`
+	MaxChunks        int                  `toml:"max_chunks"`
+	ChunkDelay       Duration             `toml:"chunk_delay"`
+	ExposeInInfo     bool                 `toml:"expose_in_info"`
+	UDP              MeshtasticUDPConfig  `toml:"udp"`
+	MQTT             MeshtasticMQTTConfig `toml:"mqtt"`
+
+	// Resolved by normalize() for runtime consumption:
+	RawPSK       []byte `toml:"-"`
+	ExpandedKey  []byte `toml:"-"`
+	BridgeNodeID uint32 `toml:"-"`
+}
+
+// MeshtasticUDPConfig configures the LAN UDP multicast Meshtastic transport.
+type MeshtasticUDPConfig struct {
+	Enabled bool   `toml:"enabled"`
+	Addr    string `toml:"addr"`
+	Iface   string `toml:"iface"`
+}
+
+// MeshtasticMQTTConfig configures the MQTT v3.1.1 Meshtastic transport.
+type MeshtasticMQTTConfig struct {
+	Enabled   bool   `toml:"enabled"`
+	Broker    string `toml:"broker"`
+	Username  string `toml:"username"`
+	Password  string `toml:"password"`
+	RootTopic string `toml:"root_topic"`
+}
+
 // Duration extends Go's time.Duration with a "d" (day) and "w" (week) suffix
 // since 4-week prune windows are awkward to express in stdlib units.
 type Duration time.Duration
@@ -414,13 +458,27 @@ func sectionsByKey() map[string][]string {
 			continue
 		}
 		section := tagName(f)
-		for j := 0; j < f.Type.NumField(); j++ {
-			if k := tagName(f.Type.Field(j)); k != "" {
-				out[k] = append(out[k], section)
-			}
+		if section == "" {
+			continue
 		}
+		collectSectionKeys(section, f.Type, out)
 	}
 	return out
+}
+
+func collectSectionKeys(section string, t reflect.Type, out map[string][]string) {
+	for j := 0; j < t.NumField(); j++ {
+		f := t.Field(j)
+		k := tagName(f)
+		if k == "" {
+			continue
+		}
+		if f.Type.Kind() == reflect.Struct {
+			collectSectionKeys(section+"."+k, f.Type, out)
+			continue
+		}
+		out[k] = append(out[k], section)
+	}
 }
 
 func tagName(f reflect.StructField) string {
@@ -483,6 +541,24 @@ func defaults() *Config {
 			Enabled:        false,
 			Mode:           PropagationModeFallback,
 			DirectAttempts: 3,
+		},
+		Meshtastic: MeshtasticConfig{
+			Enabled:          false,
+			ShortName:        "RNS",
+			NodeInfoInterval: Duration(30 * time.Minute),
+			HopLimit:         3,
+			OKToMQTT:         true,
+			NameFormat:       "short",
+			LongMessageMode:  "chunk",
+			MaxChunks:        3,
+			ChunkDelay:       Duration(2 * time.Second),
+			ExposeInInfo:     true,
+			UDP: MeshtasticUDPConfig{
+				Addr: meshtastic.DefaultUDPAddr,
+			},
+			MQTT: MeshtasticMQTTConfig{
+				RootTopic: meshtastic.DefaultMQTTRootTopic,
+			},
 		},
 	}
 }
@@ -630,7 +706,152 @@ func (c *Config) normalize() error {
 	if err := validateHashes("mods", c.Mods); err != nil {
 		return err
 	}
+	if err := c.normalizeMeshtastic(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c *Config) normalizeMeshtastic() error {
+	m := &c.Meshtastic
+	m.ChannelURL = strings.TrimSpace(m.ChannelURL)
+	m.ChannelName = strings.TrimSpace(m.ChannelName)
+	m.PSK = strings.TrimSpace(m.PSK)
+	m.NodeID = strings.TrimSpace(m.NodeID)
+	m.ShortName = strings.TrimSpace(m.ShortName)
+	m.LongName = strings.TrimSpace(m.LongName)
+
+	var urlPSK []byte
+	hasURLPSK := false
+	if m.ChannelURL != "" {
+		urlName, pskBytes, err := meshtastic.ParseChannelURL(m.ChannelURL)
+		if err != nil {
+			return fmt.Errorf("meshtastic.channel_url: %w", err)
+		}
+		if m.ChannelName == "" {
+			m.ChannelName = urlName
+		}
+		urlPSK = pskBytes
+		hasURLPSK = true
+	}
+
+	switch {
+	case m.PSK != "":
+		raw, exp, err := meshtastic.ParsePSK(m.PSK)
+		if err != nil {
+			return err
+		}
+		m.RawPSK = raw
+		m.ExpandedKey = exp
+	case hasURLPSK:
+		exp, err := meshtastic.ExpandPSK(urlPSK)
+		if err != nil {
+			return fmt.Errorf("meshtastic.channel_url psk: %w", err)
+		}
+		m.RawPSK = urlPSK
+		m.ExpandedKey = exp
+	default:
+		raw, exp, err := meshtastic.ParsePSK("default")
+		if err != nil {
+			return err
+		}
+		m.RawPSK = raw
+		m.ExpandedKey = exp
+	}
+
+	if m.NodeID != "" {
+		id, err := meshtastic.ParseNodeID(m.NodeID)
+		if err != nil {
+			return fmt.Errorf("meshtastic.node_id: %w", err)
+		}
+		m.BridgeNodeID = id
+	}
+
+	if m.ShortName == "" {
+		m.ShortName = "RNS"
+	}
+	if len(m.ShortName) > 4 {
+		return fmt.Errorf("meshtastic.short_name %q must be at most 4 bytes (got %d)", m.ShortName, len(m.ShortName))
+	}
+	if m.LongName == "" {
+		m.LongName = c.Service.DisplayName
+	}
+	if m.NodeInfoInterval.Std() < 0 {
+		return fmt.Errorf("meshtastic.nodeinfo_interval must be >= 0 (0 disables)")
+	}
+	if m.HopLimit == 0 {
+		m.HopLimit = 3
+	}
+	if m.HopLimit < 1 || m.HopLimit > 7 {
+		return fmt.Errorf("meshtastic.hop_limit must be 1..7 (got %d)", m.HopLimit)
+	}
+
+	m.NameFormat = strings.ToLower(strings.TrimSpace(m.NameFormat))
+	if m.NameFormat == "" {
+		m.NameFormat = "short"
+	}
+	if m.NameFormat != "short" && m.NameFormat != "long" {
+		return fmt.Errorf("meshtastic.name_format must be \"short\" or \"long\", got %q", m.NameFormat)
+	}
+
+	m.LongMessageMode = strings.ToLower(strings.TrimSpace(m.LongMessageMode))
+	if m.LongMessageMode == "" {
+		m.LongMessageMode = "chunk"
+	}
+	if m.LongMessageMode != "chunk" && m.LongMessageMode != "truncate" {
+		return fmt.Errorf("meshtastic.long_message_mode must be \"chunk\" or \"truncate\", got %q", m.LongMessageMode)
+	}
+	if m.MaxChunks < 0 {
+		return fmt.Errorf("meshtastic.max_chunks must be >= 1")
+	}
+	if m.MaxChunks == 0 {
+		m.MaxChunks = 3
+	}
+	if m.ChunkDelay.Std() < 0 {
+		return fmt.Errorf("meshtastic.chunk_delay must be >= 0")
+	}
+
+	m.UDP.Addr = strings.TrimSpace(m.UDP.Addr)
+	if m.UDP.Addr == "" {
+		m.UDP.Addr = meshtastic.DefaultUDPAddr
+	}
+	m.UDP.Iface = strings.TrimSpace(m.UDP.Iface)
+
+	m.MQTT.Broker = strings.TrimSpace(m.MQTT.Broker)
+	m.MQTT.RootTopic = strings.TrimSpace(m.MQTT.RootTopic)
+	if m.MQTT.RootTopic == "" {
+		m.MQTT.RootTopic = meshtastic.DefaultMQTTRootTopic
+	}
+
+	if hasMQTTTopicWildcardOrControl(m.ChannelName, true) {
+		return fmt.Errorf("meshtastic.channel_name %q must not contain '/', '+', '#', or control characters", m.ChannelName)
+	}
+	if hasMQTTTopicWildcardOrControl(m.MQTT.RootTopic, false) {
+		return fmt.Errorf("meshtastic.mqtt.root_topic %q must not contain '+', '#', or control characters", m.MQTT.RootTopic)
+	}
+
+	if m.Enabled {
+		if m.ChannelName == "" {
+			return fmt.Errorf("meshtastic.channel_name (or channel_url) is required when meshtastic.enabled is true")
+		}
+		if !m.UDP.Enabled && !m.MQTT.Enabled {
+			return fmt.Errorf("meshtastic: enable at least one transport ([meshtastic.udp] or [meshtastic.mqtt])")
+		}
+		if m.MQTT.Enabled && m.MQTT.Broker == "" {
+			return fmt.Errorf("meshtastic.mqtt.broker is required when meshtastic.mqtt.enabled is true")
+		}
+	}
+	return nil
+}
+
+func hasMQTTTopicWildcardOrControl(s string, forbidSlash bool) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f || c == '+' || c == '#' || (forbidSlash && c == '/') {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeHashList(in []string) []string {

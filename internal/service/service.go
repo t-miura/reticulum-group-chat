@@ -24,6 +24,7 @@ import (
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
+	"github.com/thatSFguy/reticulum-group-chat/internal/meshtastic"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
@@ -82,6 +83,9 @@ type Service struct {
 	// replayLimit throttles history replay per destination so a
 	// /leave + /join cycle cannot re-trigger the fan-out repeatedly.
 	replayLimit *replayLimiter
+
+	// mesh is the optional Meshtastic channel bridge (nil when disabled).
+	mesh *meshtastic.Bridge
 
 	logger *logging.Logger
 	now    func() time.Time
@@ -341,6 +345,15 @@ func New(cfg *config.Config) (*Service, error) {
 	svc.announcePersist = newAnnouncePersistTap(transport, announceStore, logger)
 	transport.RegisterAnnounceHandler(svc.announcePersist)
 
+	if cfg.Meshtastic.Enabled {
+		if err := svc.initMeshtasticBridge(); err != nil {
+			if instanceUnlock != nil {
+				instanceUnlock()
+			}
+			return nil, fmt.Errorf("init meshtastic bridge: %w", err)
+		}
+	}
+
 	return svc, nil
 }
 
@@ -418,6 +431,12 @@ func (s *Service) Run(ctx context.Context) error {
 	// path-request defer for unknown recipients. Sequential by design
 	// (half-duplex collision resilience).
 	go s.outbound.Run(tCtx)
+
+	if s.mesh != nil {
+		s.logger.Infof("meshtastic bridge   : #%s (hash=0x%02x node=%s)",
+			s.cfg.Meshtastic.ChannelName, s.mesh.ChannelHash(), meshtastic.FormatNodeBang(s.mesh.BridgeNodeID()))
+		go s.mesh.Run(tCtx)
+	}
 
 	// A pinned propagation node we haven't heard from (fresh state dir,
 	// or the announce cache aged out) can't be linked to until its

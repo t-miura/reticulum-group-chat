@@ -279,5 +279,58 @@ direct_attempts = 3
 # notes and the full reasoning.
 #node = "00112233445566778899aabbccddeeff"
 
+[meshtastic]
+# Bridge this LXMF group chat bidirectionally with a Meshtastic channel.
+# Disabled by default; requires [meshtastic.udp] and/or [meshtastic.mqtt].
+enabled = false
+
+# Option 1: Paste a Meshtastic share URL (https://meshtastic.org/e/#...) to
+# auto-populate channel_name and psk. Explicit channel_name / psk below
+# override values extracted from the URL.
+#channel_url = "https://meshtastic.org/e/#..."
+
+# Option 2: Specify channel name and PSK directly.
+channel_name = "LongFast"
+# PSK formats: "default" ("AQ=="), "none", "simple1".."simple10", "0x..." hex,
+# or base64 (1, 16, or 32 bytes).
+psk = "default"
+
+# Virtual bridge node identity shown on the Meshtastic side.
+# node_id defaults deterministically from fwdsvc's Reticulum identity hash.
+#node_id = "!aabbccdd"
+short_name = "RNS"
+#long_name = "Group Chat Bridge"
+nodeinfo_interval = "30m"
+hop_limit = 3
+ok_to_mqtt = true
+
+# How Meshtastic senders appear to LXMF members:
+#   "short" -> [M:ShortName] text (fallback [M:!abcd])
+#   "long"  -> [M:LongName] text  (fallback [M:!abcd])
+name_format = "short"
+
+# Long LXMF -> Meshtastic message policy:
+#   "chunk"    -> split into paced <=220B chunks with (1/N) markers
+#   "truncate" -> fit in a single packet with "…"
+long_message_mode = "chunk"
+max_chunks = 3
+chunk_delay = "2s"
+
+# Show the bridged Meshtastic channel in /info and enable /mesh.
+# Note: /mesh only reveals the secret PSK and share URL to admins.
+expose_in_info = true
+
+[meshtastic.udp]
+enabled = false
+addr = "224.0.0.69:4403"
+#iface = "eth0"
+
+[meshtastic.mqtt]
+enabled = false
+broker = "tcp://mqtt.meshtastic.org:1883"
+username = ""
+password = ""
+root_topic = "msh/US"
+
 # (admins / mods are now at the top of the file — see the comment block
 # at the start. They MUST be top-level keys before any [section] header.)

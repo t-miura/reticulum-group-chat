@@ -1009,6 +1009,73 @@ func TestAboutCommandReturnsVersionAndRepo(t *testing.T) {
 	}
 }
 
+func TestMeshCommandRoleAndMembershipGating(t *testing.T) {
+	d := newDispatcher(t)
+	d.Cfg.Meshtastic = config.MeshtasticConfig{
+		Enabled:      true,
+		ExposeInInfo: true,
+		ChannelName:  "LongFast",
+	}
+	d.MeshStatus = func(includeSecrets bool) string {
+		if includeSecrets {
+			return "Bridge #LongFast PSK=secret"
+		}
+		return "Bridge #LongFast"
+	}
+
+	// Non-member denied.
+	if got := d.Dispatch(userHash, Parse("/mesh")); !strings.Contains(got, "Only members") {
+		t.Errorf("/mesh as non-member = %q, want refusal", got)
+	}
+
+	// Member sees public status without secrets, and /? advertises /mesh.
+	memberRoster(t, d, userHash)
+	if got := d.Dispatch(userHash, Parse("/mesh")); got != "Bridge #LongFast" {
+		t.Errorf("/mesh as member = %q, want public status", got)
+	}
+	if help := d.Dispatch(userHash, Parse("/?")); !strings.Contains(help, "/mesh") {
+		t.Errorf("member /? missing /mesh: %q", help)
+	}
+
+	// Mod still sees no secrets.
+	if got := d.Dispatch(modHash, Parse("/mesh")); got != "Bridge #LongFast" {
+		t.Errorf("/mesh as mod = %q, want no secrets", got)
+	}
+
+	// Admin sees secrets.
+	if got := d.Dispatch(adminHash, Parse("/mesh")); got != "Bridge #LongFast PSK=secret" {
+		t.Errorf("/mesh as admin = %q, want secrets", got)
+	}
+}
+
+func TestBanAndUnbanMeshtasticNodeIDs(t *testing.T) {
+	d := newDispatcher(t)
+	banned := map[string]bool{}
+	d.MeshBan = func(spec string) (string, error) {
+		banned[spec] = true
+		return spec, nil
+	}
+	d.MeshUnban = func(spec string) (string, bool, error) {
+		ok := banned[spec]
+		delete(banned, spec)
+		return spec, ok, nil
+	}
+
+	// Regular user cannot ban mesh nodes.
+	if got := d.Dispatch(userHash, Parse("/ban !12345678")); !strings.Contains(got, "Only mods") {
+		t.Errorf("/ban !hex as user = %q", got)
+	}
+	if got := d.Dispatch(modHash, Parse("/ban !12345678")); !strings.Contains(got, "Banned Meshtastic node !12345678") {
+		t.Errorf("/ban !hex as mod = %q", got)
+	}
+	if got := d.Dispatch(modHash, Parse("/unban !12345678")); !strings.Contains(got, "Unbanned Meshtastic node !12345678") {
+		t.Errorf("/unban !hex as mod = %q", got)
+	}
+	if got := d.Dispatch(modHash, Parse("/unban !12345678")); !strings.Contains(got, "not banned") {
+		t.Errorf("second /unban !hex = %q", got)
+	}
+}
+
 // TestAboutTextFitsOpportunisticPacket pins that /about always ships
 // in a single opportunistic packet — like /? it's a fire-and-forget
 // reply with no link-delivery fallback path on small clients.

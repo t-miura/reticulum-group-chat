@@ -109,6 +109,11 @@ type Dispatcher struct {
 	// Lets the operator see the full list in the troubleshooting log even
 	// though the user receives a truncated version.
 	OverflowLog func(format string, args ...any)
+
+	// Meshtastic bridge hooks (nil when Meshtastic bridging is disabled).
+	MeshStatus func(includeSecrets bool) string
+	MeshBan    func(nodeSpec string) (label string, err error)
+	MeshUnban  func(nodeSpec string) (nodeBang string, ok bool, err error)
 }
 
 // Dispatch handles a single command and returns the reply text. An empty
@@ -118,7 +123,7 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 	caller := d.deriveCaller(senderHash)
 	switch parsed.Name {
 	case "?", "help":
-		return helpText(caller)
+		return d.renderHelp(caller)
 	case "about", "version":
 		return aboutText()
 	case "info":
@@ -131,6 +136,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handlePin(caller, parsed.Rest)
 	case "unpin":
 		return d.handleUnpin(caller, parsed.Args)
+	case "mesh":
+		return d.handleMesh(caller)
 	case "users":
 		// Members only. The roster (nicknames + hash prefixes) is
 		// group-internal information, and the reply is one line per
@@ -261,7 +268,16 @@ func aboutText() string {
 	return "fwdsvc v" + version.Version + "\nSource: " + version.RepoURL
 }
 
+func (d *Dispatcher) renderHelp(c *Caller) string {
+	showMesh := d.Cfg != nil && d.Cfg.Meshtastic.Enabled && d.Cfg.Meshtastic.ExposeInInfo && (c.Member || c.Role.atLeastMod())
+	return helpTextWithMesh(c, showMesh)
+}
+
 func helpText(c *Caller) string {
+	return helpTextWithMesh(c, false)
+}
+
+func helpTextWithMesh(c *Caller, showMesh bool) string {
 	var b strings.Builder
 	b.WriteString("Commands:\n")
 	b.WriteString("/?, /help\n")
@@ -277,6 +293,9 @@ func helpText(c *Caller) string {
 		b.WriteString("/leave - leave the chat\n")
 		b.WriteString("/pause /resume - mute/unmute\n")
 		b.WriteString("/textonly /showall - skip media\n")
+	}
+	if showMesh {
+		b.WriteString("/mesh - meshtastic bridge\n")
 	}
 
 	if c.Role.atLeastMod() {
@@ -800,12 +819,33 @@ func (d *Dispatcher) handleKick(role Role, args []string) string {
 	return fmt.Sprintf("Kicked %s. They can rejoin with /join.", label)
 }
 
+func (d *Dispatcher) handleMesh(c *Caller) string {
+	if d.Cfg == nil || !d.Cfg.Meshtastic.Enabled || !d.Cfg.Meshtastic.ExposeInInfo || d.MeshStatus == nil {
+		return "Meshtastic bridge is not enabled on this group."
+	}
+	if !c.Member && c.Role == RoleUser {
+		return "Only members can view mesh bridge details. Send /join first."
+	}
+	return d.MeshStatus(c.Role == RoleAdmin)
+}
+
 func (d *Dispatcher) handleBan(role Role, args []string) string {
 	if !role.atLeastMod() {
 		return "Only mods or admins can ban."
 	}
 	if len(args) != 1 {
 		return "Usage: /ban <user>"
+	}
+	arg := strings.TrimSpace(args[0])
+	if strings.HasPrefix(arg, "!") {
+		if d.MeshBan == nil {
+			return "Meshtastic bridge is not enabled."
+		}
+		label, err := d.MeshBan(arg)
+		if err != nil {
+			return err.Error()
+		}
+		return fmt.Sprintf("Banned Meshtastic node %s. Their messages will be dropped.", label)
 	}
 	target, err := d.Roster.Resolve(args[0])
 	if err != nil {
@@ -828,7 +868,21 @@ func (d *Dispatcher) handleUnban(role Role, args []string) string {
 	if len(args) != 1 {
 		return "Usage: /unban <user>"
 	}
-	hash := strings.ToLower(strings.TrimSpace(args[0]))
+	arg := strings.TrimSpace(args[0])
+	if strings.HasPrefix(arg, "!") {
+		if d.MeshUnban == nil {
+			return "Meshtastic bridge is not enabled."
+		}
+		nodeBang, ok, err := d.MeshUnban(arg)
+		if err != nil {
+			return err.Error()
+		}
+		if !ok {
+			return fmt.Sprintf("%s is not banned.", arg)
+		}
+		return fmt.Sprintf("Unbanned Meshtastic node %s.", nodeBang)
+	}
+	hash := strings.ToLower(arg)
 	for _, h := range d.Roster.Banlist() {
 		if h == hash {
 			ok, err := d.Roster.Unban(h)

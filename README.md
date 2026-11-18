@@ -331,6 +331,7 @@ everything.
 | `/textonly`               | members     | Skip attachments — receive only the text body of forwarded messages. Intended for users on slow / metered links. |
 | `/showall`                | members     | Reverse `/textonly` — resume receiving attachments. |
 | `/nick <newname>`         | members     | Change own nickname (1–24 chars from `[A-Za-z0-9_-]`) |
+| `/mesh`                   | members     | Show Meshtastic bridge status, channel name, transports, and heard nodes (admins also see the secret PSK and share URL). |
 
 ### Mod / admin commands
 
@@ -338,8 +339,8 @@ everything.
 |---|---|---|
 | `/nick <user> <newname>`  | mods, admins | Change another user's nickname |
 | `/kick <user>`            | mods, admins | Remove from roster (user can `/join` again) |
-| `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused |
-| `/unban <user>`           | mods, admins | Remove from banlist |
+| `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused. Also accepts `!hex` Meshtastic node IDs (e.g. `/ban !12345678`). |
+| `/unban <user>`           | mods, admins | Remove from banlist. Also accepts `!hex` Meshtastic node IDs. |
 | `/adduser <hash>`         | mods, admins | Add a user by their 32-hex destination hash — the invite path for a `locked` group. Adds them to the roster and sends a welcome + replay. |
 | `/removeuser <user>`      | mods, admins | Remove a member. In a `locked` group they can't return until re-added (unlike `/kick`, which lets them `/join` again in an open group). Not punitive like `/ban`. |
 | `/pin <text>`             | mods, admins | Pin a message for the group — shown by `/pins` and replayed to every new member after their history catch-up. Max 10 pins, 200 bytes each. |
@@ -596,6 +597,31 @@ Notes:
 - The node's announced per-transfer size limit is enforced before
   upload; oversize messages fail that route rather than being
   silently truncated.
+
+### `[meshtastic]`
+
+Optional bidirectional bridge between this LXMF group chat and a
+Meshtastic channel (joined via `channel_name` + `psk` or a `channel_url`)
+over LAN UDP multicast (`224.0.0.69:4403`) and/or MQTT (`<root_topic>/2/e/<channel_name>/+`):
+
+- **Identity & attribution**: `fwdsvc` acts as a single virtual
+  Meshtastic node (`short_name` / `long_name`) and forwards LXMF messages
+  as `[nick] text`. Inbound Meshtastic broadcast messages are attributed
+  as `[M:ShortName] text` (learned from `NODEINFO_APP` and persisted in
+  `meshnodes.json`) and recorded in join replay history.
+- **Replies & tap-backs**: Replies (`FIELD_REPLY_TO` ↔ `reply_id`) and
+  emoji tap-back reactions (`FIELD_REACTION` ↔ `emoji + reply_id`) bind
+  natively in both directions through `idmap`.
+- **Endpoint-only transport**: Packets arriving on UDP and MQTT are
+  deduplicated by `(from, packet_id)` and never cross-relayed between UDP
+  and MQTT. Private Meshtastic DMs and leading-slash commands from the RF
+  channel are ignored.
+- **Security**: Secret PSKs and shareable `channel_url` links in `/mesh`
+  are restricted strictly to `admins`. Mods/admins can block noisy
+  Meshtastic peers with `/ban !12345678` and `/unban !12345678`.
+
+See [configs/fwdsvc.example.toml](configs/fwdsvc.example.toml) for all
+`[meshtastic]`, `[meshtastic.udp]`, and `[meshtastic.mqtt]` keys.
 
 ---
 
@@ -1191,7 +1217,14 @@ round-tripping back to the mobile UI.
 
 ### License
 
-MIT.
+The combined project and distributed binaries (including the Meshtastic
+channel bridge in `internal/meshtastic` and its integration) are licensed
+under the **GNU General Public License v3.0 or later (GPLv3)** — see
+[LICENSE](LICENSE).
+
+The original upstream `reticulum-group-chat` codebase and non-Meshtastic
+components remain licensed under the **MIT License** — see
+[LICENSE-MIT](LICENSE-MIT).
 
 ### Contributing
 
