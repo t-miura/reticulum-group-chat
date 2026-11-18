@@ -13,7 +13,7 @@ import (
 )
 
 // DefaultUDPAddr is Meshtastic's standard LAN multicast address and port.
-const DefaultUDPAddr = "224.0.0.69:4403"
+const DefaultUDPAddr = "239.0.0.69:4403"
 
 // UDPTransport sends and receives raw Meshtastic MeshPacket protobuf datagrams
 // over UDP multicast (or unicast UDP in tests).
@@ -35,7 +35,7 @@ type UDPTransport struct {
 	closed         bool
 }
 
-// NewUDPTransport constructs a UDPTransport targeting addr (e.g. "224.0.0.69:4403").
+// NewUDPTransport constructs a UDPTransport targeting addr (e.g. "239.0.0.69:4403").
 // ifaceName optionally pins multicast membership and outbound packets to a specific interface.
 func NewUDPTransport(addr, ifaceName string, logger *logging.Logger) *UDPTransport {
 	if addr == "" {

@@ -602,7 +602,14 @@ Notes:
 
 Optional bidirectional bridge between this LXMF group chat and a
 Meshtastic channel (joined via `channel_name` + `psk` or a `channel_url`)
-over LAN UDP multicast (`224.0.0.69:4403`) and/or MQTT (`<root_topic>/2/e/<channel_name>/+`):
+over LAN UDP multicast (`239.0.0.69:4403`) and/or MQTT (`<root_topic>/2/e/<channel_name>/+`):
+
+> **Meshtastic node settings for MQTT downlink:** To receive messages
+> published by `fwdsvc` on your Meshtastic device, enable **Downlink enabled**
+> on the bridged channel in Channel Settings (and ensure LoRa **Ignore MQTT**
+> is off). Also note that `mqtt.meshtastic.org` rewrites `hop_limit = 0` on
+> public/default-key traffic, so an MQTT-connected gateway node displays
+> messages locally without rebroadcasting them over LoRa to other nodes.
 
 - **Identity & attribution**: `fwdsvc` acts as a single virtual
   Meshtastic node (`short_name` / `long_name`) and forwards LXMF messages

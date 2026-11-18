@@ -322,11 +322,14 @@ expose_in_info = true
 
 [meshtastic.udp]
 enabled = false
-addr = "224.0.0.69:4403"
+addr = "239.0.0.69:4403"
 #iface = "eth0"
 
 [meshtastic.mqtt]
 enabled = false
+# Note: On Meshtastic nodes, enable "Downlink enabled" on the bridged channel
+# in Channel Settings (and ensure LoRa "Ignore MQTT" is off) to receive MQTT
+# messages sent by this bridge.
 broker = "tcp://mqtt.meshtastic.org:1883"
 username = ""
 password = ""

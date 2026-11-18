@@ -335,7 +335,6 @@ func (b *Bridge) SendText(text string, replyToPacketID uint32) []uint32 {
 			}
 			continue
 		}
-		pkt.WantAck = true
 		if b.enqueueTx(pkt) {
 			ids = append(ids, pkt.ID)
 		}
@@ -480,6 +479,10 @@ func (b *Bridge) handleInboundPacket(pkt *MeshPacket) {
 		}
 		b.markSeen(pkt.From, pkt.ID, now)
 		b.nodedb.UpdateUser(pkt.From, user.ShortName, user.LongName, now)
+		if b.logger != nil {
+			b.logger.Debugf("meshtastic inbound nodeinfo: from=%s short=%q long=%q",
+				FormatNodeBang(pkt.From), user.ShortName, user.LongName)
+		}
 		if data.WantResponse && pkt.To == b.cfg.BridgeNodeID {
 			b.maybeReplyNodeInfo(pkt.From, pkt.ID, now)
 		}
@@ -499,6 +502,10 @@ func (b *Bridge) handleInboundPacket(pkt *MeshPacket) {
 			return
 		}
 		b.nodedb.Touch(pkt.From, now)
+		if b.logger != nil {
+			b.logger.Infof("meshtastic inbound text: from=%s pkt_id=0x%08x len=%d via_mqtt=%v",
+				FormatNodeBang(pkt.From), pkt.ID, len(data.Payload), pkt.ViaMQTT)
+		}
 		if b.onMessage != nil {
 			b.onMessage(InboundMessage{
 				From:     pkt.From,
