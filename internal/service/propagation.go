@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vmihailenco/msgpack/v5"
+
 	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
@@ -84,11 +86,27 @@ func (t *propagationTracker) AspectMatch(nameHash []byte) bool {
 	return bytes.Equal(nameHash, lxmfPropagationNameHash)
 }
 
+// parsePropagationAnnounceAppData accepts the 7-element LXMF propagation
+// announce format and the newer format that appends an eighth extension
+// field. The tracker only needs the original seven fields; the extension
+// is intentionally ignored so newer nodes remain interoperable with this
+// version of reticulum-go.
+func parsePropagationAnnounceAppData(appData []byte) (*lxmf.PropagationNodeInfo, error) {
+	var elems []msgpack.RawMessage
+	if err := msgpack.Unmarshal(appData, &elems); err == nil && len(elems) == 8 {
+		normalized, err := msgpack.Marshal(elems[:7])
+		if err == nil {
+			return lxmf.ParsePropagationNodeAppData(normalized)
+		}
+	}
+	return lxmf.ParsePropagationNodeAppData(appData)
+}
+
 // OnAnnounce parses the §5.8.5 app_data and records the node. Malformed
 // app_data is logged and skipped — a node we can't parse is a node we
 // can't negotiate stamps/limits with, so it is never a send candidate.
 func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
-	info, err := lxmf.ParsePropagationNodeAppData(a.AppData)
+	info, err := parsePropagationAnnounceAppData(a.AppData)
 	if err != nil {
 		// Debug, not info: unlike the cases below this one has no
 		// first-heard check, so it fires on EVERY announce from a node

@@ -16,7 +16,7 @@ func pnAnnounce(t *testing.T, destByte byte, enabled bool) *rns.Announce {
 	t.Helper()
 	appData, err := msgpack.Marshal([]any{
 		false, time.Now().Unix(), enabled, 256, 256,
-		[]any{0, 0, 0}, map[any]any{},
+		[]any{0, 0, 0}, map[any]any{}, "future-extension",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +81,14 @@ func TestTrackerPrefersLongestKnownNode(t *testing.T) {
 	want := bytes.Repeat([]byte{0xaa}, 16)
 	if !bytes.Equal(got, want) {
 		t.Errorf("Current() = %x, want longest-known node %x", got, want)
+	}
+}
+
+func TestTrackerAcceptsEightElementAnnounce(t *testing.T) {
+	tr := newTestTracker(nil)
+	tr.OnAnnounce(pnAnnounce(t, 0xcc, true))
+	if got := tr.Current(); !bytes.Equal(got, bytes.Repeat([]byte{0xcc}, 16)) {
+		t.Errorf("Current() = %x after 8-element announce, want node cc", got)
 	}
 }
 
