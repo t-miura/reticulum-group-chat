@@ -176,7 +176,9 @@ func (s *Service) forwardToMeshtastic(content, senderNick, body string, fwdField
 			if targetHex != "" && emojiStr != "" {
 				if tb := s.idmap.Lookup(targetHex); tb != nil {
 					if meshID, ok := tb.PrimaryMeshID(); ok {
-						s.mesh.SendReaction(emojiStr, meshID)
+						if pktID := s.mesh.SendReaction(emojiStr, meshID); pktID != 0 {
+							s.logger.Infof("meshtastic outbound reaction: from=%s target=0x%08x pkt_id=0x%08x", senderNick, meshID, pktID)
+						}
 					}
 				}
 			}
@@ -204,6 +206,9 @@ func (s *Service) forwardToMeshtastic(content, senderNick, body string, fwdField
 	}
 
 	ids := s.mesh.SendText(meshText, replyMeshID)
+	if len(ids) > 0 {
+		s.logger.Infof("meshtastic outbound text: from=%s chunks=%d pkt_id=0x%08x len=%d", senderNick, len(ids), ids[0], len(meshText))
+	}
 	if bubble != nil && s.idmap != nil {
 		for _, id := range ids {
 			s.idmap.RegisterMeshID(bubble, id)

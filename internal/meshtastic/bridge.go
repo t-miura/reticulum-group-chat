@@ -280,7 +280,7 @@ func (b *Bridge) runTxLoop(ctx context.Context) {
 		}
 		for _, tr := range b.transports {
 			if err := tr.Send(ctx, pkt); err != nil && b.logger != nil {
-				b.logger.Debugf("meshtastic %s send id=0x%08x: %v", tr.Name(), pkt.ID, err)
+				b.logger.Warnf("meshtastic %s send id=0x%08x failed: %v", tr.Name(), pkt.ID, err)
 			}
 		}
 		lastSend = b.now()
@@ -335,6 +335,7 @@ func (b *Bridge) SendText(text string, replyToPacketID uint32) []uint32 {
 			}
 			continue
 		}
+		pkt.WantAck = true
 		if b.enqueueTx(pkt) {
 			ids = append(ids, pkt.ID)
 		}

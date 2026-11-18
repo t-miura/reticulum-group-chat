@@ -86,6 +86,8 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		}
 		s.logger.Infof("inbound LXMF: from=%s content_len=%d field_count=%d field_keys=%v",
 			senderHex[:8], len(msg.Content), len(msg.Fields), fieldKeys)
+	} else {
+		s.logger.Debugf("inbound LXMF: from=%s content_len=%d", senderHex[:8], len(msg.Content))
 	}
 
 	// Log the full sender hash on first contact so operators can find it
@@ -139,6 +141,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// Non-members get an invitation, NOT auto-joined. They have to
 	// explicitly send /join to participate.
 	if !s.roster.Has(senderBytes) {
+		s.logger.Infof("inbound LXMF from non-member %s (%d B): sent /join invite", senderHex[:8], len(content))
 		s.replyInvite(senderBytes)
 		return
 	}

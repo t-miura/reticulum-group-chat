@@ -287,7 +287,16 @@ func (m *MQTTTransport) Send(_ context.Context, pkt *MeshPacket) error {
 	}
 	pub := encodeMQTTPublish(m.PubTopic(), env.Marshal())
 	if err := m.writeRaw(conn, pub); err != nil {
+		m.mu.Lock()
+		if m.conn == conn {
+			m.connected = false
+		}
+		m.mu.Unlock()
+		_ = conn.Close()
 		return fmt.Errorf("meshtastic mqtt publish: %w", err)
+	}
+	if m.logger != nil {
+		m.logger.Debugf("meshtastic mqtt published id=0x%08x to %s (%d B)", pkt.ID, m.PubTopic(), len(pub))
 	}
 	return nil
 }

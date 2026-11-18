@@ -189,3 +189,44 @@ func TestTrackerIgnoresMalformedAppData(t *testing.T) {
 		t.Errorf("Current() = %x after malformed announce, want nil", got)
 	}
 }
+
+func TestNormalizePropagationAppDataForSendPropagated(t *testing.T) {
+	transport := rns.NewTransport(nil)
+	ki := makeKnownIdentity(0xdd, time.Now())
+	eightElem, err := msgpack.Marshal([]any{
+		false, time.Now().Unix(), true, 256, 256,
+		[]any{0, 0, 0}, map[any]any{}, "future-extension",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ki.AppData = eightElem
+	transport.Restore(ki)
+
+	if _, err := lxmf.ParsePropagationNodeAppData(eightElem); err == nil {
+		t.Fatal("expected reticulum-go ParsePropagationNodeAppData to reject 8-element array")
+	}
+
+	recalled := transport.Recall(ki.DestHash)
+	if recalled == nil {
+		t.Fatal("Recall returned nil")
+	}
+	norm, changed := normalizePropagationAppData(recalled.AppData)
+	if !changed {
+		t.Fatal("expected 8-element app_data to be normalized")
+	}
+	recalled.AppData = norm
+	transport.Restore(recalled)
+
+	after := transport.Recall(ki.DestHash)
+	if after == nil {
+		t.Fatal("Recall after Restore returned nil")
+	}
+	info, err := lxmf.ParsePropagationNodeAppData(after.AppData)
+	if err != nil {
+		t.Fatalf("ParsePropagationNodeAppData after normalization failed: %v", err)
+	}
+	if !info.Enabled || info.PerTransferLimitKB != 256 {
+		t.Errorf("unexpected parsed info: %+v", info)
+	}
+}

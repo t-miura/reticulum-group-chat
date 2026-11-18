@@ -86,20 +86,28 @@ func (t *propagationTracker) AspectMatch(nameHash []byte) bool {
 	return bytes.Equal(nameHash, lxmfPropagationNameHash)
 }
 
+// normalizePropagationAppData converts 8-element LXMF propagation announce
+// app_data arrays (which append an extension element) into the 7-element form
+// accepted by reticulum-go's ParsePropagationNodeAppData.
+func normalizePropagationAppData(appData []byte) ([]byte, bool) {
+	var elems []msgpack.RawMessage
+	if err := msgpack.Unmarshal(appData, &elems); err == nil && len(elems) == 8 {
+		normalized, err := msgpack.Marshal(elems[:7])
+		if err == nil {
+			return normalized, true
+		}
+	}
+	return appData, false
+}
+
 // parsePropagationAnnounceAppData accepts the 7-element LXMF propagation
 // announce format and the newer format that appends an eighth extension
 // field. The tracker only needs the original seven fields; the extension
 // is intentionally ignored so newer nodes remain interoperable with this
 // version of reticulum-go.
 func parsePropagationAnnounceAppData(appData []byte) (*lxmf.PropagationNodeInfo, error) {
-	var elems []msgpack.RawMessage
-	if err := msgpack.Unmarshal(appData, &elems); err == nil && len(elems) == 8 {
-		normalized, err := msgpack.Marshal(elems[:7])
-		if err == nil {
-			return lxmf.ParsePropagationNodeAppData(normalized)
-		}
-	}
-	return lxmf.ParsePropagationNodeAppData(appData)
+	normalized, _ := normalizePropagationAppData(appData)
+	return lxmf.ParsePropagationNodeAppData(normalized)
 }
 
 // OnAnnounce parses the §5.8.5 app_data and records the node. Malformed

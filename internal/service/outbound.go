@@ -912,6 +912,12 @@ func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[a
 			return nil, errNoPropagationNode
 		}
 	}
+	if known := d.transport.Recall(node); known != nil {
+		if norm, changed := normalizePropagationAppData(known.AppData); changed {
+			known.AppData = norm
+			d.transport.Restore(known)
+		}
+	}
 	msgID, err := d.delivery.SendPropagated(node, recipient, nil, body, fields)
 	// Name the node. Store-and-forward only completes when the
 	// RECIPIENT fetches, so "which node did we hand this to?" is the

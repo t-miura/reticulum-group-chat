@@ -26,12 +26,13 @@ type UDPTransport struct {
 	// openConns, when set (tests), overrides OS UDP socket creation.
 	openConns func() (recv net.PacketConn, send net.PacketConn, dst net.Addr, err error)
 
-	mu       sync.Mutex
-	recvConn net.PacketConn
-	sendConn net.PacketConn
-	dstAddr  net.Addr
-	readyCh  chan struct{}
-	closed   bool
+	mu             sync.Mutex
+	recvConn       net.PacketConn
+	sendConn       net.PacketConn
+	extraSendConns []net.PacketConn
+	dstAddr        net.Addr
+	readyCh        chan struct{}
+	closed         bool
 }
 
 // NewUDPTransport constructs a UDPTransport targeting addr (e.g. "224.0.0.69:4403").
@@ -68,15 +69,16 @@ func (u *UDPTransport) Ready() <-chan struct{} {
 // Run opens the UDP socket and reads MeshPacket datagrams until ctx is cancelled.
 func (u *UDPTransport) Run(ctx context.Context, onPacket func(*MeshPacket)) error {
 	var (
-		recvConn net.PacketConn
-		sendConn net.PacketConn
-		dstAddr  net.Addr
-		err      error
+		recvConn       net.PacketConn
+		sendConn       net.PacketConn
+		extraSendConns []net.PacketConn
+		dstAddr        net.Addr
+		err            error
 	)
 	if u.openConns != nil {
 		recvConn, sendConn, dstAddr, err = u.openConns()
 	} else {
-		recvConn, sendConn, dstAddr, err = u.openOSConns()
+		recvConn, sendConn, extraSendConns, dstAddr, err = u.openOSConns()
 	}
 	if err != nil {
 		return err
@@ -85,6 +87,7 @@ func (u *UDPTransport) Run(ctx context.Context, onPacket func(*MeshPacket)) erro
 	u.mu.Lock()
 	u.recvConn = recvConn
 	u.sendConn = sendConn
+	u.extraSendConns = extraSendConns
 	u.dstAddr = dstAddr
 	select {
 	case <-u.readyCh:
@@ -103,6 +106,9 @@ func (u *UDPTransport) Run(ctx context.Context, onPacket func(*MeshPacket)) erro
 		u.closed = true
 		_ = recvConn.Close()
 		_ = sendConn.Close()
+		for _, ec := range extraSendConns {
+			_ = ec.Close()
+		}
 		u.mu.Unlock()
 	}()
 
@@ -134,10 +140,10 @@ func (u *UDPTransport) Run(ctx context.Context, onPacket func(*MeshPacket)) erro
 	}
 }
 
-func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, error) {
+func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, []net.PacketConn, net.Addr, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp4", u.addr)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("meshtastic udp resolve %q: %w", u.addr, err)
+		return nil, nil, nil, nil, fmt.Errorf("meshtastic udp resolve %q: %w", u.addr, err)
 	}
 
 	isMulticast := udpAddr.IP != nil && udpAddr.IP.IsMulticast()
@@ -148,12 +154,12 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 	if isMulticast {
 		primary, allIFs, err = selectMulticastInterfaces(u.ifaceName)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	} else if u.ifaceName != "" {
 		ifi, ierr := net.InterfaceByName(u.ifaceName)
 		if ierr != nil {
-			return nil, nil, nil, fmt.Errorf("meshtastic udp interface %q: %w", u.ifaceName, ierr)
+			return nil, nil, nil, nil, fmt.Errorf("meshtastic udp interface %q: %w", u.ifaceName, ierr)
 		}
 		primary = ifi
 	}
@@ -162,7 +168,7 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 	if isMulticast {
 		recvConn, err = net.ListenMulticastUDP("udp4", primary, udpAddr)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("meshtastic udp listen multicast %s: %w", u.addr, err)
+			return nil, nil, nil, nil, fmt.Errorf("meshtastic udp listen multicast %s: %w", u.addr, err)
 		}
 		for i := 1; i < len(allIFs); i++ {
 			if jerr := joinMulticastGroup(recvConn, &allIFs[i], udpAddr.IP); jerr != nil && u.logger != nil {
@@ -172,7 +178,7 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 	} else {
 		recvConn, err = net.ListenUDP("udp4", udpAddr)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("meshtastic udp listen %s: %w", u.addr, err)
+			return nil, nil, nil, nil, fmt.Errorf("meshtastic udp listen %s: %w", u.addr, err)
 		}
 	}
 
@@ -187,10 +193,40 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 	sendConn, err := net.ListenUDP("udp4", sendLocal)
 	if err != nil {
 		_ = recvConn.Close()
-		return nil, nil, nil, fmt.Errorf("meshtastic udp open sender: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("meshtastic udp open sender: %w", err)
 	}
 	if isMulticast {
 		configureMulticastSender(sendConn, primaryIP)
+	}
+
+	var extraSendConns []net.PacketConn
+	var extraNames []string
+	if isMulticast && len(allIFs) > 1 {
+		seenIPs := make(map[string]struct{})
+		if primaryIP != nil {
+			seenIPs[primaryIP.String()] = struct{}{}
+		}
+		for i := 1; i < len(allIFs); i++ {
+			ip := firstUsableIPv4(&allIFs[i])
+			if ip == nil {
+				continue
+			}
+			key := ip.String()
+			if _, exists := seenIPs[key]; exists {
+				continue
+			}
+			ec, eerr := net.ListenUDP("udp4", &net.UDPAddr{IP: ip, Port: 0})
+			if eerr != nil {
+				if u.logger != nil {
+					u.logger.Debugf("meshtastic udp open extra sender on %s (%v): %v", allIFs[i].Name, ip, eerr)
+				}
+				continue
+			}
+			configureMulticastSender(ec, ip)
+			extraSendConns = append(extraSendConns, ec)
+			extraNames = append(extraNames, fmt.Sprintf("%s(%v)", allIFs[i].Name, ip))
+			seenIPs[key] = struct{}{}
+		}
 	}
 
 	if u.logger != nil && isMulticast {
@@ -199,8 +235,8 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 			for i := range allIFs {
 				names[i] = allIFs[i].Name
 			}
-			u.logger.Infof("meshtastic udp multicast interface: primary=%s (%v) joined=%v",
-				primary.Name, primaryIP, names)
+			u.logger.Infof("meshtastic udp multicast interface: primary=%s (%v) joined=%v extra_tx=%v",
+				primary.Name, primaryIP, names, extraNames)
 		} else {
 			u.logger.Warnf("meshtastic udp multicast: no non-loopback IPv4 interface found, using OS default")
 		}
@@ -212,7 +248,10 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 		if rerr != nil {
 			_ = recvConn.Close()
 			_ = sendConn.Close()
-			return nil, nil, nil, fmt.Errorf("meshtastic udp resolve target %q: %w", u.target, rerr)
+			for _, ec := range extraSendConns {
+				_ = ec.Close()
+			}
+			return nil, nil, nil, nil, fmt.Errorf("meshtastic udp resolve target %q: %w", u.target, rerr)
 		}
 		dstAddr = tAddr
 	} else if udpAddr.Port == 0 {
@@ -220,7 +259,7 @@ func (u *UDPTransport) openOSConns() (net.PacketConn, net.PacketConn, net.Addr, 
 			dstAddr = la
 		}
 	}
-	return recvConn, sendConn, dstAddr, nil
+	return recvConn, sendConn, extraSendConns, dstAddr, nil
 }
 
 // Send marshals pkt and writes it to the configured UDP destination.
@@ -230,6 +269,7 @@ func (u *UDPTransport) Send(_ context.Context, pkt *MeshPacket) error {
 	}
 	u.mu.Lock()
 	sendConn := u.sendConn
+	extra := append([]net.PacketConn(nil), u.extraSendConns...)
 	dstAddr := u.dstAddr
 	closed := u.closed
 	u.mu.Unlock()
@@ -238,8 +278,24 @@ func (u *UDPTransport) Send(_ context.Context, pkt *MeshPacket) error {
 		return fmt.Errorf("meshtastic udp transport not running")
 	}
 	raw := pkt.Marshal()
+	var firstErr error
+	sentAny := false
 	if _, err := sendConn.WriteTo(raw, dstAddr); err != nil {
-		return fmt.Errorf("meshtastic udp write: %w", err)
+		firstErr = fmt.Errorf("meshtastic udp write: %w", err)
+	} else {
+		sentAny = true
+	}
+	for _, ec := range extra {
+		if _, err := ec.WriteTo(raw, dstAddr); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("meshtastic udp write: %w", err)
+			}
+		} else {
+			sentAny = true
+		}
+	}
+	if !sentAny && firstErr != nil {
+		return firstErr
 	}
 	return nil
 }
