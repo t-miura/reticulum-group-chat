@@ -92,6 +92,10 @@ func (d *deliveryRetriever) DeliveryHash() []byte {
 }
 
 func (d *deliveryRetriever) Retrieve(ctx context.Context, nodeDestHash []byte, opts lxmf.RetrieveOptions) (*lxmf.RetrieveResult, error) {
+	// Ensure a co-located shared-instance propagation node (wire hops=0)
+	// uses HEADER_1 rather than HEADER_2 with rnsd's transport_id.
+	normalizeZeroHopPeer(d.transport, nodeDestHash)
+
 	// If no active link exists yet, open one first and give handleLRProof a
 	// brief moment to emit LRRTT + LINKIDENTIFY before RetrievePropagated
 	// sends /get — prevents the responder seeing /get before LRRTT transitions
@@ -500,6 +504,12 @@ func (s *propagationSyncer) syncOnce(ctx context.Context) syncCycleSummary {
 					s.logger.Warnf("propagation sync: node %s unknown and path request failed: %v", nodeShort, rerr)
 				} else {
 					s.logger.Infof("propagation sync: node %s unknown — requested path", nodeShort)
+				}
+			case errors.Is(err, rns.ErrLinkHandshakeTimeout):
+				if rerr := s.retriever.RequestPath(node); rerr != nil {
+					s.logger.Warnf("propagation sync: node %s link handshake timed out (path request also failed: %v)", nodeShort, rerr)
+				} else {
+					s.logger.Warnf("propagation sync: node %s link handshake timed out — requested fresh path", nodeShort)
 				}
 			case errors.Is(err, lxmf.ErrPropagationThrottled):
 				bo := s.bumpBackoff()

@@ -412,7 +412,14 @@ func TestSyncOnceErrorRecoveryAndBackoff(t *testing.T) {
 		t.Errorf("teardowns after ErrPropagationNoIdentity = %d, want 2", ret.teardowns)
 	}
 
-	// 4. Throttled -> exponential backoff (2m, 4m), then reset on clean sync.
+	// 4. Handshake timeout -> RequestPath to refresh potentially stale route.
+	nextErr = fmt.Errorf("link: %w", rns.ErrLinkHandshakeTimeout)
+	syncer.syncOnce(context.Background())
+	if len(ret.pathReqs) != 2 || !bytes.Equal(ret.pathReqs[1], nodeDest) {
+		t.Errorf("pathReqs after ErrLinkHandshakeTimeout = %d, want 2", len(ret.pathReqs))
+	}
+
+	// 5. Throttled -> exponential backoff (2m, 4m), then reset on clean sync.
 	nextErr = lxmf.ErrPropagationThrottled
 	syncer.syncOnce(context.Background())
 	if got := syncer.nextInterval(); got != 2*time.Minute {
@@ -860,4 +867,143 @@ sync_interval = "10s"
 	if propFallback || propAlways {
 		t.Errorf("receive_only mode enabled outbound propagation (fallback=%v always=%v)", propFallback, propAlways)
 	}
+}
+
+// TestZeroHopHeader2AnnounceEmitsHeader1LinkRequest reproduces the co-located
+// rnsd + lxmd bug (RNS/Transport.py:1003-1010, 1699, 2429-2433, 2941):
+// rnsd rebroadcasts a local shared-instance client's announce as HEADER_2 with
+// hops=0 and transport_id=rnsd_id. If fwdsvc sends a HEADER_2 LINKREQUEST,
+// rnsd does not strip it at remaining_hops==0 (local_hops_delta==0) and lxmd
+// silently drops it. Clearing TransportID for wire hops==0 makes fwdsvc send
+// HEADER_1 like upstream Python RNS, while multi-hop peers (hops >= 1) keep
+// their TransportID for HEADER_2 routing.
+func TestZeroHopHeader2AnnounceEmitsHeader1LinkRequest(t *testing.T) {
+	nodeID, err := rns.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeDest := nodeID.DestinationHashFor(lxmf.PropagationFullName())
+	rnsdTransportID := bytes.Repeat([]byte{0x77}, 16)
+
+	dir := t.TempDir()
+	cfgSrc := fmt.Sprintf(`[service]
+display_name = "zero-hop-test"
+identity_path = %q
+state_path = %q
+history_path = %q
+
+[propagation]
+enabled = true
+mode = "receive_only"
+node = %q
+sync_interval = "10s"
+`, filepath.Join(dir, "id"), filepath.Join(dir, "state.json"), filepath.Join(dir, "history.json"), hex.EncodeToString(nodeDest))
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(cfgSrc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		if svc.instanceUnlock != nil {
+			svc.instanceUnlock()
+		}
+	})
+
+	svcIface, tapIface, stopWire := newPairedMemInterfaces()
+	svc.transport.AddInterface(svcIface)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go svc.transport.Run(ctx)
+	t.Cleanup(func() { cancel(); stopWire() })
+
+	// 1. Deliver a HEADER_2 announce with Hops=0 (co-located lxmd behind rnsd).
+	localAnn, err := rns.BuildAnnounce(nodeID, lxmf.PropagationFullName(), pnAppData(t, true, 256, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localAnn.HeaderType = rns.HeaderType2
+	localAnn.TransportType = rns.NetworkTransport
+	localAnn.TransportID = rnsdTransportID
+	localAnn.Hops = 0
+	rawLocal, err := localAnn.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tapIface.Send(rawLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Also deliver a HEADER_2 announce with Hops=1 (remote multi-hop peer).
+	remoteID, _ := rns.NewIdentity()
+	remoteDest := remoteID.DestinationHashFor(lxmf.FullName())
+	remoteAnn, err := rns.BuildAnnounce(remoteID, lxmf.FullName(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAnn.HeaderType = rns.HeaderType2
+	remoteAnn.TransportType = rns.NetworkTransport
+	remoteAnn.TransportID = rnsdTransportID
+	remoteAnn.Hops = 1
+	rawRemote, err := remoteAnn.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tapIface.Send(rawRemote); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for both announces to be processed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.transport.Recall(nodeDest) != nil && svc.transport.Recall(remoteDest) != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Hops==0 peer MUST have TransportID cleared; Hops==1 peer MUST keep it.
+	if k := svc.transport.Recall(nodeDest); k == nil {
+		t.Fatal("0-hop propagation node was not cached")
+	} else if len(k.TransportID) != 0 {
+		t.Errorf("0-hop local-client peer kept TransportID %x, want nil (HEADER_1)", k.TransportID)
+	}
+	if k := svc.transport.Recall(remoteDest); k == nil {
+		t.Fatal("1-hop remote peer was not cached")
+	} else if !bytes.Equal(k.TransportID, rnsdTransportID) {
+		t.Errorf("1-hop remote peer TransportID = %x, want %x (HEADER_2 preserved)", k.TransportID, rnsdTransportID)
+	}
+
+	// Trigger AcquireLink toward the 0-hop propagation node and inspect the actual
+	// LINKREQUEST packet emitted on the wire: it MUST be HEADER_1 (no transport_id).
+	linkErrCh := make(chan error, 1)
+	go func() {
+		_, err := svc.transport.AcquireLink(nodeDest, 500*time.Millisecond)
+		linkErrCh <- err
+	}()
+
+	var sawLR *rns.Packet
+	waitLR := time.After(time.Second)
+	for sawLR == nil {
+		select {
+		case raw := <-tapIface.Inbox():
+			pkt, err := rns.ParsePacket(raw)
+			if err == nil && pkt.PacketType == rns.PacketLinkRequest && bytes.Equal(pkt.DestHash, nodeDest) {
+				sawLR = pkt
+			}
+		case <-waitLR:
+			t.Fatal("timed out waiting for outbound LINKREQUEST")
+		}
+	}
+	if sawLR.HeaderType != rns.HeaderType1 || len(sawLR.TransportID) != 0 {
+		t.Errorf("outbound LINKREQUEST to 0-hop peer used header=%d transport_id=%x, want HEADER_1 with nil transport_id",
+			sawLR.HeaderType, sawLR.TransportID)
+	}
+	<-linkErrCh
 }

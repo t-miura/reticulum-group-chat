@@ -913,8 +913,15 @@ func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[a
 		}
 	}
 	if known := d.transport.Recall(node); known != nil {
-		if norm, changed := normalizePropagationAppData(known.AppData); changed {
+		changed := false
+		if norm, appChanged := normalizePropagationAppData(known.AppData); appChanged {
 			known.AppData = norm
+			changed = true
+		}
+		if normalizeZeroHopTransportID(known) {
+			changed = true
+		}
+		if changed {
 			d.transport.Restore(known)
 		}
 	}

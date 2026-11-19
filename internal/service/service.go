@@ -349,6 +349,7 @@ func New(cfg *config.Config) (*Service, error) {
 	delivery.OnMessage = svc.onLXMFReceived
 	delivery.OnError = func(err error) { logger.Infof("inbound: %v", err) }
 
+	transport.RegisterAnnounceHandler(&zeroHopRouteNormalizer{transport: transport, logger: logger})
 	transport.RegisterAnnounceHandler(&announceTap{svc: svc})
 
 	// Persist the announce cache so a service restart can reach every
@@ -361,6 +362,7 @@ func New(cfg *config.Config) (*Service, error) {
 		logger.Warnf("announce cache load: %v (continuing with empty cache)", err)
 	} else {
 		for _, e := range entries {
+			normalizeZeroHopTransportID(e)
 			transport.Restore(e)
 		}
 		if len(entries) > 0 || dropped > 0 {
@@ -477,8 +479,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if s.mesh != nil {
-		s.logger.Infof("meshtastic bridge   : #%s (hash=0x%02x node=%s)",
-			s.cfg.Meshtastic.ChannelName, s.mesh.ChannelHash(), meshtastic.FormatNodeBang(s.mesh.BridgeNodeID()))
+		s.logger.Infof("meshtastic bridge   : %s", s.mesh.StartupSummary())
 		go s.mesh.Run(tCtx)
 	}
 

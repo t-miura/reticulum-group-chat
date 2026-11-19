@@ -207,3 +207,73 @@ func (t *announcePersistTap) saveNow() {
 		t.logger.Errorf("announce cache save: %v", err)
 	}
 }
+
+// normalizeZeroHopTransportID clears TransportID on a KnownIdentity whose
+// wire hop count is 0.
+//
+// Why this is needed against upstream Python rnsd (RNS/Transport.py):
+// When a local client (such as lxmd) is attached to rnsd via a shared
+// instance (LocalClientInterface), rnsd records it at path_table hops=0
+// (RNS/Transport.py:2316) and rebroadcasts its announces / path responses
+// out external interfaces (TCPServerInterface) as HEADER_2 with
+// transport_id=rnsd.identity.hash and hops=0 (RNS/Transport.py:1003-1010).
+//
+// Upstream Python clients increment hops on receive (0 -> 1) and only emit
+// HEADER_2 when path_table hops > 1 (RNS/Transport.py:1699), so they send
+// HEADER_1 for a wire hops=0 announce. reticulum-go@v0.8.1 keeps wire
+// hops=0 and emits HEADER_2 whenever KnownIdentity.TransportID != nil
+// (rns/transport.go:1683). On rnsd with default local_hops_delta == 0,
+// remaining_hops == 0 does NOT strip HEADER_2 (RNS/Transport.py:2429-2433),
+// so lxmd receives a HEADER_2 LINKREQUEST carrying rnsd's transport_id and
+// silently drops it at RNS/Transport.py:2941 (its ephemeral client
+// Transport.identity does not match rnsd's), causing LRPROOF timeouts.
+//
+// Clearing TransportID when wire Hops == 0 makes reticulum-go emit HEADER_1
+// (matching upstream RNS/Transport.py:1699). rnsd sees for_local_client=True
+// (RNS/Transport.py:2346, 2384-2385), populates link_table, forwards HEADER_1
+// to lxmd, and routes LRPROOF back. Multi-hop peers (wire Hops >= 1,
+// including local_hops_delta 2..7) retain their TransportID untouched.
+func normalizeZeroHopTransportID(k *rns.KnownIdentity) bool {
+	if k == nil || k.Hops != 0 || len(k.TransportID) == 0 {
+		return false
+	}
+	k.TransportID = nil
+	return true
+}
+
+// normalizeZeroHopPeer ensures a recalled destination in transport.known
+// has its TransportID cleared if its cached wire hop count is 0.
+func normalizeZeroHopPeer(transport *rns.Transport, destHash []byte) bool {
+	if transport == nil || len(destHash) != rns.IdentityHashLen {
+		return false
+	}
+	known := transport.Recall(destHash)
+	if !normalizeZeroHopTransportID(known) {
+		return false
+	}
+	transport.Restore(known)
+	return true
+}
+
+// zeroHopRouteNormalizer is an AnnounceHandler that strips TransportID from
+// live wire-hops=0 HEADER_2 announces stored in Transport.known so links and
+// packets to shared-instance clients co-located on our rnsd (e.g. lxmd) use
+// HEADER_1 like upstream Python RNS.
+type zeroHopRouteNormalizer struct {
+	transport *rns.Transport
+	logger    *logging.Logger
+}
+
+func (n *zeroHopRouteNormalizer) AspectMatch(_ []byte) bool { return true }
+
+func (n *zeroHopRouteNormalizer) OnAnnounce(a *rns.Announce) {
+	if a == nil || a.Hops != 0 || len(a.TransportID) == 0 {
+		return
+	}
+	if normalizeZeroHopPeer(n.transport, a.DestHash) && n.logger != nil {
+		n.logger.Debugf("announce: cleared transport_id on 0-hop local-client peer %x (use HEADER_1 per RNS/Transport.py:1699)",
+			safePrefix(a.DestHash))
+	}
+}
+
+var _ rns.AnnounceHandler = (*zeroHopRouteNormalizer)(nil)
