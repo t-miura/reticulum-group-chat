@@ -116,9 +116,10 @@ type Dispatcher struct {
 	OverflowLog func(format string, args ...any)
 
 	// Meshtastic bridge hooks (nil when Meshtastic bridging is disabled).
-	MeshStatus func(includeSecrets bool) string
-	MeshBan    func(nodeSpec string) (label string, err error)
-	MeshUnban  func(nodeSpec string) (nodeBang string, ok bool, err error)
+	MeshStatus      func(includeSecrets bool) string
+	MeshChannelName func() string
+	MeshBan         func(nodeSpec string) (label string, err error)
+	MeshUnban       func(nodeSpec string) (nodeBang string, ok bool, err error)
 }
 
 // Dispatch handles a single command and returns the reply text. An empty

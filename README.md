@@ -610,21 +610,37 @@ Notes:
 ### `[meshtastic]`
 
 Optional bidirectional bridge between this LXMF group chat and a
-Meshtastic channel (joined via `channel_name` + `psk` or a `channel_url`)
-over LAN UDP multicast (`239.0.0.69:4403`) and/or MQTT (`<root_topic>/2/e/<channel_name>/+`):
+Meshtastic channel. Two selectable modes are supported via `mode`:
 
-> **Meshtastic node settings for MQTT downlink:** To receive messages
-> published by `fwdsvc` on your Meshtastic device, enable **Downlink enabled**
-> on the bridged channel in Channel Settings (and ensure LoRa **Ignore MQTT**
-> is off). Also note that `mqtt.meshtastic.org` rewrites `hop_limit = 0` on
-> public/default-key traffic, so an MQTT-connected gateway node displays
-> messages locally without rebroadcasting them over LoRa to other nodes.
+- **`mode = "internal"` (default)**: Built-in zero-dependency virtual
+  Meshtastic node connecting directly to a channel (`channel_name` +
+  `psk` or `channel_url`) over LAN UDP multicast (`239.0.0.69:4403`,
+  `[meshtastic.udp]`) and/or MQTT (`<root_topic>/2/e/<channel_name>/+`,
+  `[meshtastic.mqtt]`).
+- **`mode = "external"`**: Connects via Meshtastic's TCP StreamAPI
+  (default port `4403`, `[meshtastic.tcp]`) to a real external Meshtastic
+  node — such as a local/remote `meshtasticd` virtual node or a
+  Wi-Fi/Ethernet hardware Meshtastic node (including direct LoRa RF).
+  The external node owns encryption, routing, NodeInfo broadcasts, and
+  LoRa/UDP/MQTT connectivity; `fwdsvc` syncs its NodeDB and channel table
+  on connect, matching either `[meshtastic.tcp].channel_index` (`0..7`),
+  `channel_name`, or the node's primary channel when both are unset.
 
-- **Identity & attribution**: `fwdsvc` acts as a single virtual
-  Meshtastic node (`short_name` / `long_name`) and forwards LXMF messages
-  as `[nick] text`. Inbound Meshtastic broadcast messages are attributed
-  as `[M:ShortName] text` (learned from `NODEINFO_APP` and persisted in
-  `meshnodes.json`) and recorded in join replay history.
+> **Meshtastic node settings for MQTT downlink (internal mode):** To receive
+> messages published by `fwdsvc` on your Meshtastic device, enable
+> **Downlink enabled** on the bridged channel in Channel Settings (and ensure
+> LoRa **Ignore MQTT** is off). Also note that `mqtt.meshtastic.org` rewrites
+> `hop_limit = 0` on public/default-key traffic, so an MQTT-connected gateway
+> node displays messages locally without rebroadcasting them over LoRa to
+> other nodes.
+
+- **Identity & attribution**: In `internal` mode, `fwdsvc` acts as a
+  single virtual Meshtastic node (`short_name` / `long_name`); in
+  `external` mode, messages originate from the connected Meshtastic node
+  itself. LXMF messages are forwarded as `[nick] text`. Inbound
+  Meshtastic broadcast messages are attributed as `[M:ShortName] text`
+  (learned from `NODEINFO_APP` and the external node's NodeDB, persisted
+  in `meshnodes.json`) and recorded in join replay history.
 - **Replies & tap-backs**: Replies (`FIELD_REPLY_TO` ↔ `reply_id`) and
   emoji tap-back reactions (`FIELD_REACTION` ↔ `emoji + reply_id`) bind
   natively in both directions through `idmap`.
@@ -637,7 +653,8 @@ over LAN UDP multicast (`239.0.0.69:4403`) and/or MQTT (`<root_topic>/2/e/<chann
   Meshtastic peers with `/ban !12345678` and `/unban !12345678`.
 
 See [configs/fwdsvc.example.toml](configs/fwdsvc.example.toml) for all
-`[meshtastic]`, `[meshtastic.udp]`, and `[meshtastic.mqtt]` keys.
+`[meshtastic]`, `[meshtastic.udp]`, `[meshtastic.mqtt]`, and
+`[meshtastic.tcp]` keys.
 
 ---
 

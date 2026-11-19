@@ -404,9 +404,16 @@ type ReplayConfig struct {
 	PinsOnJoin bool `toml:"pins_on_join"`
 }
 
+// Meshtastic mode values accepted in MeshtasticConfig.Mode.
+const (
+	MeshtasticModeInternal = meshtastic.ModeInternal
+	MeshtasticModeExternal = meshtastic.ModeExternal
+)
+
 // MeshtasticConfig configures the optional bidirectional Meshtastic channel bridge.
 type MeshtasticConfig struct {
 	Enabled          bool                 `toml:"enabled"`
+	Mode             string               `toml:"mode"` // "internal" (default) or "external"
 	ChannelURL       string               `toml:"channel_url"`
 	ChannelName      string               `toml:"channel_name"`
 	PSK              string               `toml:"psk"`
@@ -423,6 +430,7 @@ type MeshtasticConfig struct {
 	ExposeInInfo     bool                 `toml:"expose_in_info"`
 	UDP              MeshtasticUDPConfig  `toml:"udp"`
 	MQTT             MeshtasticMQTTConfig `toml:"mqtt"`
+	TCP              MeshtasticTCPConfig  `toml:"tcp"`
 
 	// Resolved by normalize() for runtime consumption:
 	RawPSK       []byte `toml:"-"`
@@ -444,6 +452,13 @@ type MeshtasticMQTTConfig struct {
 	Username  string `toml:"username"`
 	Password  string `toml:"password"`
 	RootTopic string `toml:"root_topic"`
+}
+
+// MeshtasticTCPConfig configures the external-node Meshtastic TCP StreamAPI client
+// (meshtasticd or a Wi-Fi/Ethernet hardware node) when meshtastic.mode = "external".
+type MeshtasticTCPConfig struct {
+	Addr         string `toml:"addr"`
+	ChannelIndex *int   `toml:"channel_index"`
 }
 
 // Duration extends Go's time.Duration with a "d" (day) and "w" (week) suffix
@@ -597,6 +612,7 @@ func defaults() *Config {
 		},
 		Meshtastic: MeshtasticConfig{
 			Enabled:          false,
+			Mode:             MeshtasticModeInternal,
 			ShortName:        "RNS",
 			NodeInfoInterval: Duration(30 * time.Minute),
 			HopLimit:         3,
@@ -611,6 +627,9 @@ func defaults() *Config {
 			},
 			MQTT: MeshtasticMQTTConfig{
 				RootTopic: meshtastic.DefaultMQTTRootTopic,
+			},
+			TCP: MeshtasticTCPConfig{
+				Addr: meshtastic.DefaultTCPAddr,
 			},
 		},
 	}
@@ -801,6 +820,14 @@ func (c *Config) normalize() error {
 
 func (c *Config) normalizeMeshtastic() error {
 	m := &c.Meshtastic
+	m.Mode = strings.ToLower(strings.TrimSpace(m.Mode))
+	if m.Mode == "" {
+		m.Mode = MeshtasticModeInternal
+	}
+	if m.Mode != MeshtasticModeInternal && m.Mode != MeshtasticModeExternal {
+		return fmt.Errorf("meshtastic.mode must be %q or %q, got %q",
+			MeshtasticModeInternal, MeshtasticModeExternal, m.Mode)
+	}
 	m.ChannelURL = strings.TrimSpace(m.ChannelURL)
 	m.ChannelName = strings.TrimSpace(m.ChannelName)
 	m.PSK = strings.TrimSpace(m.PSK)
@@ -910,7 +937,21 @@ func (c *Config) normalizeMeshtastic() error {
 		m.MQTT.RootTopic = meshtastic.DefaultMQTTRootTopic
 	}
 
-	if hasMQTTTopicWildcardOrControl(m.ChannelName, true) {
+	normTCP, tcpErr := meshtastic.NormalizeTCPAddr(m.TCP.Addr)
+	if tcpErr != nil {
+		return fmt.Errorf("meshtastic.tcp.addr: %w", tcpErr)
+	}
+	m.TCP.Addr = normTCP
+	if m.TCP.ChannelIndex != nil {
+		if *m.TCP.ChannelIndex < 0 || *m.TCP.ChannelIndex > 7 {
+			return fmt.Errorf("meshtastic.tcp.channel_index must be 0..7 (got %d)", *m.TCP.ChannelIndex)
+		}
+	}
+
+	if hasControlChar(m.ChannelName) {
+		return fmt.Errorf("meshtastic.channel_name %q must not contain control characters", m.ChannelName)
+	}
+	if m.Mode == MeshtasticModeInternal && hasMQTTTopicWildcardOrControl(m.ChannelName, true) {
 		return fmt.Errorf("meshtastic.channel_name %q must not contain '/', '+', '#', or control characters", m.ChannelName)
 	}
 	if hasMQTTTopicWildcardOrControl(m.MQTT.RootTopic, false) {
@@ -918,17 +959,33 @@ func (c *Config) normalizeMeshtastic() error {
 	}
 
 	if m.Enabled {
-		if m.ChannelName == "" {
-			return fmt.Errorf("meshtastic.channel_name (or channel_url) is required when meshtastic.enabled is true")
-		}
-		if !m.UDP.Enabled && !m.MQTT.Enabled {
-			return fmt.Errorf("meshtastic: enable at least one transport ([meshtastic.udp] or [meshtastic.mqtt])")
-		}
-		if m.MQTT.Enabled && m.MQTT.Broker == "" {
-			return fmt.Errorf("meshtastic.mqtt.broker is required when meshtastic.mqtt.enabled is true")
+		if m.Mode == MeshtasticModeExternal {
+			if m.TCP.Addr == "" {
+				return fmt.Errorf("meshtastic.tcp.addr is required when meshtastic.mode is %q", MeshtasticModeExternal)
+			}
+		} else {
+			if m.ChannelName == "" {
+				return fmt.Errorf("meshtastic.channel_name (or channel_url) is required when meshtastic.enabled is true")
+			}
+			if !m.UDP.Enabled && !m.MQTT.Enabled {
+				return fmt.Errorf("meshtastic: enable at least one transport ([meshtastic.udp] or [meshtastic.mqtt])")
+			}
+			if m.MQTT.Enabled && m.MQTT.Broker == "" {
+				return fmt.Errorf("meshtastic.mqtt.broker is required when meshtastic.mqtt.enabled is true")
+			}
 		}
 	}
 	return nil
+}
+
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func hasMQTTTopicWildcardOrControl(s string, forbidSlash bool) bool {

@@ -308,27 +308,45 @@ sync_timeout = "2m"
 
 [meshtastic]
 # Bridge this LXMF group chat bidirectionally with a Meshtastic channel.
-# Disabled by default; requires [meshtastic.udp] and/or [meshtastic.mqtt].
+# Disabled by default.
 enabled = false
 
-# Option 1: Paste a Meshtastic share URL (https://meshtastic.org/e/#...) to
-# auto-populate channel_name and psk. Explicit channel_name / psk below
-# override values extracted from the URL.
+# Bridge mode:
+#   "internal" (default) — built-in virtual node over [meshtastic.udp] and/or
+#                          [meshtastic.mqtt]; requires no external Meshtastic
+#                          daemon or hardware node.
+#   "external"           — connects via TCP/IP (StreamAPI) to a real Meshtastic
+#                          node (meshtasticd or a Wi-Fi/Ethernet hardware node)
+#                          configured under [meshtastic.tcp] for full Meshtastic
+#                          compatibility (including direct LoRa RF, UDP, MQTT,
+#                          AEAD/PKI/XEdDSA handled by the node itself).
+mode = "internal"
+
+# Option 1 (internal mode, or channel-name match in external mode): Paste a
+# Meshtastic share URL (https://meshtastic.org/e/#...) to auto-populate
+# channel_name and psk. Explicit channel_name / psk below override values
+# extracted from the URL.
 #channel_url = "https://meshtastic.org/e/#..."
 
 # Option 2: Specify channel name and PSK directly.
+# In "internal" mode, channel_name is required and psk encrypts/decrypts packets.
+# In "external" mode, channel_name selects which enabled channel on the external
+# node to bridge (unless meshtastic.tcp.channel_index is set; leave both unset
+# to use the external node's PRIMARY channel). PSK is taken from the external node.
 channel_name = "LongFast"
-# PSK formats: "default" ("AQ=="), "none", "simple1".."simple10", "0x..." hex,
-# or base64 (1, 16, or 32 bytes).
+# PSK formats (internal mode only): "default" ("AQ=="), "none", "simple1".."simple10",
+# "0x..." hex, or base64 (1, 16, or 32 bytes).
 psk = "default"
 
-# Virtual bridge node identity shown on the Meshtastic side.
+# Virtual bridge node identity shown on the Meshtastic side (internal mode only;
+# external mode uses the connected node's own identity and NodeInfo announcements).
 # node_id defaults deterministically from fwdsvc's Reticulum identity hash.
 #node_id = "!aabbccdd"
 short_name = "RNS"
 #long_name = "Group Chat Bridge"
 nodeinfo_interval = "30m"
 hop_limit = 3
+# Internal mode only; external mode respects the external node's own ok_to_mqtt setting.
 ok_to_mqtt = true
 
 # How Meshtastic senders appear to LXMF members:
@@ -348,11 +366,13 @@ chunk_delay = "2s"
 expose_in_info = true
 
 [meshtastic.udp]
+# Used when meshtastic.mode = "internal".
 enabled = false
 addr = "239.0.0.69:4403"
 #iface = "eth0"
 
 [meshtastic.mqtt]
+# Used when meshtastic.mode = "internal".
 enabled = false
 # Note: On Meshtastic nodes, enable "Downlink enabled" on the bridged channel
 # in Channel Settings (and ensure LoRa "Ignore MQTT" is off) to receive MQTT
@@ -361,6 +381,17 @@ broker = "tcp://mqtt.meshtastic.org:1883"
 username = ""
 password = ""
 root_topic = "msh/US"
+
+[meshtastic.tcp]
+# Used when meshtastic.mode = "external".
+# TCP StreamAPI address of meshtasticd or a Wi-Fi/Ethernet Meshtastic hardware node.
+# Default port is 4403 when omitted.
+addr = "127.0.0.1:4403"
+# Optional explicit channel index (0..7) on the external node to bridge.
+# When commented out, fwdsvc matches meshtastic.channel_name against the
+# external node's enabled channels (or uses the PRIMARY channel if channel_name
+# is empty).
+#channel_index = 0
 
 # (admins / mods are now at the top of the file — see the comment block
 # at the start. They MUST be top-level keys before any [section] header.)

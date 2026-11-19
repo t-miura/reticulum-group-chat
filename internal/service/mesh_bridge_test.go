@@ -1,10 +1,14 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -468,5 +472,257 @@ func TestMeshInboundRespectsMaxInboundChars(t *testing.T) {
 	defer fs.mu.Unlock()
 	if len(fs.sendCalls) != 1 || string(fs.sendCalls[0]) != "[M:!3344] 123456789…" {
 		t.Errorf("truncated mesh forward = %q, want [M:!3344] 123456789…", fs.sendCalls)
+	}
+}
+
+func writeTestStreamFrame(w io.Writer, payload []byte) error {
+	hdr := [4]byte{0x94, 0xC3, byte(len(payload) >> 8), byte(len(payload))}
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func readTestStreamFrame(r *bufio.Reader) ([]byte, error) {
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if b != 0x94 {
+			continue
+		}
+		b2, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if b2 != 0xC3 {
+			continue
+		}
+		var lb [2]byte
+		if _, err := io.ReadFull(r, lb[:]); err != nil {
+			return nil, err
+		}
+		n := int(binary.BigEndian.Uint16(lb[:]))
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+}
+
+func TestServiceExternalMeshtasticdTCPIntegration(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen mock meshtasticd: %v", err)
+	}
+	defer ln.Close()
+
+	txCh := make(chan *meshtastic.MeshPacket, 8)
+	pushCh := make(chan *meshtastic.FromRadio, 8)
+
+	// Minimal mock meshtasticd over real loopback TCP.
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer conn.Close()
+		var wmu sync.Mutex
+		sendFR := func(fr *meshtastic.FromRadio) {
+			wmu.Lock()
+			defer wmu.Unlock()
+			_ = writeTestStreamFrame(conn, fr.Marshal())
+		}
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case fr := <-pushCh:
+					sendFR(fr)
+				}
+			}
+		}()
+
+		br := bufio.NewReader(conn)
+		for {
+			raw, rerr := readTestStreamFrame(br)
+			if rerr != nil {
+				return
+			}
+			tr, uerr := meshtastic.UnmarshalToRadio(raw)
+			if uerr != nil {
+				continue
+			}
+			switch {
+			case tr.WantConfigID != 0:
+				sendFR(&meshtastic.FromRadio{MyInfo: &meshtastic.MyNodeInfo{MyNodeNum: 0x55aa1122}})
+				sendFR(&meshtastic.FromRadio{NodeInfo: &meshtastic.NodeInfo{
+					Num:  0x55aa1122,
+					User: &meshtastic.User{ID: "!55aa1122", ShortName: "DAEM", LongName: "Local Meshtasticd"},
+				}})
+				sendFR(&meshtastic.FromRadio{Channel: &meshtastic.Channel{
+					Index: 0, Role: meshtastic.ChannelRolePrimary, HasSettings: true,
+					Settings: meshtastic.ChannelSettings{Name: "", PSK: []byte{0x01}},
+				}})
+				sendFR(&meshtastic.FromRadio{Channel: &meshtastic.Channel{
+					Index: 1, Role: meshtastic.ChannelRoleSecondary, HasSettings: true,
+					Settings: meshtastic.ChannelSettings{Name: "RFBridge", PSK: []byte{0x01}},
+				}})
+				sendFR(&meshtastic.FromRadio{Config: &meshtastic.RadioConfig{
+					LoRa: &meshtastic.LoRaConfig{UsePreset: true, ModemPreset: 0, HopLimit: 3},
+				}})
+				sendFR(&meshtastic.FromRadio{NodeInfo: &meshtastic.NodeInfo{
+					Num:       0x778899aa,
+					User:      &meshtastic.User{ID: "!778899aa", ShortName: "RF01", LongName: "RF Radio 1"},
+					LastHeard: uint32(time.Now().Unix()),
+				}})
+				sendFR(&meshtastic.FromRadio{ConfigCompleteID: tr.WantConfigID, HasConfigCompleteID: true})
+			case tr.Packet != nil:
+				txCh <- tr.Packet
+				sendFR(&meshtastic.FromRadio{QueueStatus: &meshtastic.QueueStatus{Res: 0, Free: 15, Maxlen: 16, MeshPacketID: tr.Packet.ID}})
+			case tr.Disconnect:
+				return
+			}
+		}
+	}()
+
+	aliceID, aliceDest := newSender(t)
+	aliceHex := hex.EncodeToString(aliceDest)
+	_, bobDest := newSender(t)
+	bobHex := hex.EncodeToString(bobDest)
+
+	dir := t.TempDir()
+	// Note: channel_name is omitted; channel_index = 1 selects "RFBridge" from the node!
+	src := fmt.Sprintf(`admins = [%q]
+
+[service]
+display_name = "External Mesh Chat"
+identity_path = %q
+state_path = %q
+history_path = %q
+
+[meshtastic]
+enabled = true
+mode = "external"
+chunk_delay = "0s"
+
+[meshtastic.tcp]
+addr = %q
+channel_index = 1
+`,
+		aliceHex,
+		filepath.Join(dir, "identity"),
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "history.json"),
+		ln.Addr().String(),
+	)
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatalf("service.New: %v", err)
+	}
+	fs := &fakeSender{}
+	svc.outbound = newOutboundQueue(fs, nil, svc.logger)
+	svc.outbound.SetIDMap(svc.idmap)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	meshDone := make(chan struct{})
+	go func() {
+		defer close(meshDone)
+		svc.mesh.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-meshDone
+		if svc.instanceUnlock != nil {
+			svc.instanceUnlock()
+		}
+	}()
+
+	select {
+	case <-svc.mesh.TCPTransport().Ready():
+	case <-time.After(3 * time.Second):
+		t.Fatal("external TCP bridge did not complete handshake")
+	}
+
+	if _, err := svc.roster.AddOrUpdate(aliceDest, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+	_ = svc.roster.SetNickname(aliceHex, "alice")
+	if _, err := svc.roster.AddOrUpdate(bobDest, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+	_ = svc.roster.SetNickname(bobHex, "bob")
+
+	// 1. /info reflects the channel name learned dynamically from the external node (#RFBridge).
+	if info := svc.dispatcher.Dispatch(bobHex, commands.Parse("/info")); !strings.Contains(info, "Meshtastic: #RFBridge (/mesh)") {
+		t.Errorf("/info = %q, want learned #RFBridge", info)
+	}
+
+	// 2. /mesh hides PSK for members, reveals external node's channel PSK for admins.
+	if st := svc.dispatcher.Dispatch(bobHex, commands.Parse("/mesh")); strings.Contains(st, "PSK:") || !strings.Contains(st, "!55aa1122") || !strings.Contains(st, "mode external") {
+		t.Errorf("member /mesh unexpected:\n%s", st)
+	}
+	if st := svc.dispatcher.Dispatch(aliceHex, commands.Parse("/mesh")); !strings.Contains(st, "PSK: AQ==") || !strings.Contains(st, "#RFBridge") {
+		t.Errorf("admin /mesh unexpected:\n%s", st)
+	}
+
+	// 3. LXMF -> external Meshtastic node on channel index 1.
+	svc.onLXMFReceived(inbound(t, svc, aliceID, aliceDest, "hello via meshtasticd"))
+	select {
+	case pkt := <-txCh:
+		if pkt.Channel != 1 || pkt.To != meshtastic.BroadcastAddr || pkt.Decoded == nil ||
+			string(pkt.Decoded.Payload) != "[alice] hello via meshtasticd" {
+			t.Errorf("outbound external pkt = %+v", pkt)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for outbound packet on mock meshtasticd")
+	}
+
+	// 4. External Meshtastic RF peer (attributed via handshake-seeded NodeDB!) -> LXMF roster.
+	pushCh <- &meshtastic.FromRadio{
+		Packet: &meshtastic.MeshPacket{
+			From:    0x778899aa,
+			To:      meshtastic.BroadcastAddr,
+			Channel: 1,
+			ID:      0xaa001122,
+			Decoded: &meshtastic.Data{
+				Portnum: meshtastic.PortNumTextMessageApp,
+				Payload: []byte("roger from lora rf"),
+			},
+		},
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var sawRF bool
+	for time.Now().Before(deadline) {
+		svc.outbound.processOnce(context.Background())
+		fs.mu.Lock()
+		for _, body := range fs.sendCalls {
+			if string(body) == "[M:RF01] roger from lora rf" {
+				sawRF = true
+			}
+		}
+		fs.mu.Unlock()
+		if sawRF {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawRF {
+		t.Fatalf("LXMF roster did not receive RF message; sendCalls=%q", fs.sendCalls)
 	}
 }

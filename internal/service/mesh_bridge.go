@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 	"github.com/thatSFguy/reticulum-group-chat/internal/meshtastic"
@@ -19,10 +20,11 @@ func meshNodesPath(statePath string) string {
 func (s *Service) initMeshtasticBridge() error {
 	mCfg := s.cfg.Meshtastic
 	bridgeID := mCfg.BridgeNodeID
-	if bridgeID == 0 {
+	if mCfg.Mode != config.MeshtasticModeExternal && bridgeID == 0 {
 		bridgeID = meshtastic.DeriveNodeID(s.identity.Hash())
 	}
 	mb, err := meshtastic.NewBridge(meshtastic.BridgeConfig{
+		Mode:             mCfg.Mode,
 		ChannelName:      mCfg.ChannelName,
 		RawPSK:           mCfg.RawPSK,
 		ExpandedKey:      mCfg.ExpandedKey,
@@ -45,12 +47,15 @@ func (s *Service) initMeshtasticBridge() error {
 		MQTTUsername:     mCfg.MQTT.Username,
 		MQTTPassword:     mCfg.MQTT.Password,
 		MQTTRoot:         mCfg.MQTT.RootTopic,
+		TCPAddr:          mCfg.TCP.Addr,
+		TCPChannelIndex:  mCfg.TCP.ChannelIndex,
 	}, s.onMeshReceived, s.logger)
 	if err != nil {
 		return err
 	}
 	s.mesh = mb
 	s.dispatcher.MeshStatus = mb.StatusSummary
+	s.dispatcher.MeshChannelName = mb.ChannelName
 	s.dispatcher.MeshBan = func(spec string) (string, error) {
 		_, label, err := mb.NodeDB().Ban(spec)
 		return label, err

@@ -750,4 +750,74 @@ func TestLoadExampleConfigNoWarnings(t *testing.T) {
 	if len(c.Warnings) != 0 {
 		t.Errorf("example config emitted warnings: %q", c.Warnings)
 	}
+	if c.Meshtastic.Mode != MeshtasticModeInternal {
+		t.Errorf("example meshtastic.mode = %q, want %q", c.Meshtastic.Mode, MeshtasticModeInternal)
+	}
+	if c.Meshtastic.TCP.Addr != meshtastic.DefaultTCPAddr {
+		t.Errorf("example meshtastic.tcp.addr = %q, want %q", c.Meshtastic.TCP.Addr, meshtastic.DefaultTCPAddr)
+	}
+}
+
+func TestMeshtasticExternalModeConfig(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Minimal external mode: bare host (default :4403), no channel_name, no udp/mqtt enabled.
+	minPath := filepath.Join(dir, "ext-min.toml")
+	minBody := "[service]\ndisplay_name = \"x\"\n" +
+		"[meshtastic]\nenabled = true\nmode = \"External\"\n" +
+		"[meshtastic.tcp]\naddr = \"192.168.1.50\"\n"
+	if err := os.WriteFile(minPath, []byte(minBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(minPath)
+	if err != nil {
+		t.Fatalf("Load minimal external config: %v", err)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", cfg.Warnings)
+	}
+	if cfg.Meshtastic.Mode != MeshtasticModeExternal {
+		t.Errorf("Mode = %q, want %q", cfg.Meshtastic.Mode, MeshtasticModeExternal)
+	}
+	if cfg.Meshtastic.TCP.Addr != "192.168.1.50:4403" {
+		t.Errorf("TCP.Addr = %q, want 192.168.1.50:4403", cfg.Meshtastic.TCP.Addr)
+	}
+	if cfg.Meshtastic.TCP.ChannelIndex != nil {
+		t.Errorf("TCP.ChannelIndex = %v, want nil", *cfg.Meshtastic.TCP.ChannelIndex)
+	}
+
+	// 2. Explicit channel_index = 0 and leftover internal [meshtastic.mqtt] enabled without broker
+	//    must succeed cleanly when mode = "external" so operators can flip modes without deleting sections.
+	idxPath := filepath.Join(dir, "ext-idx.toml")
+	idxBody := "[service]\ndisplay_name = \"x\"\n" +
+		"[meshtastic]\nenabled = true\nmode = \"external\"\nchannel_name = \"Mesh#1\"\n" +
+		"[meshtastic.mqtt]\nenabled = true\nbroker = \"\"\n" +
+		"[meshtastic.tcp]\naddr = \"127.0.0.1:4403\"\nchannel_index = 0\n"
+	if err := os.WriteFile(idxPath, []byte(idxBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := Load(idxPath)
+	if err != nil {
+		t.Fatalf("Load external config with explicit channel_index=0: %v", err)
+	}
+	if cfg2.Meshtastic.TCP.ChannelIndex == nil || *cfg2.Meshtastic.TCP.ChannelIndex != 0 {
+		t.Fatalf("TCP.ChannelIndex = %v, want 0", cfg2.Meshtastic.TCP.ChannelIndex)
+	}
+
+	// 3. Invalid mode, out-of-range channel_index, or bad tcp.addr must fail.
+	badCases := []string{
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nmode = \"direct\"\n",
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nmode = \"external\"\n[meshtastic.tcp]\nchannel_index = -1\n",
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nmode = \"external\"\n[meshtastic.tcp]\nchannel_index = 8\n",
+		"[service]\ndisplay_name = \"x\"\n[meshtastic]\nenabled = true\nmode = \"external\"\n[meshtastic.tcp]\naddr = \"http://127.0.0.1:4403\"\n",
+	}
+	for i, snippet := range badCases {
+		p := filepath.Join(dir, "bad-ext.toml")
+		if err := os.WriteFile(p, []byte(snippet), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Errorf("case %d: expected error for:\n%s", i, snippet)
+		}
+	}
 }

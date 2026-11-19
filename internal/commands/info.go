@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 	"github.com/thatSFguy/reticulum-group-chat/internal/groupinfo"
 )
 
@@ -52,8 +53,18 @@ func (d *Dispatcher) renderInfo(c *Caller, info string, pins int) string {
 		b.WriteString("\nNo description set.")
 	}
 
-	if d.Cfg != nil && d.Cfg.Meshtastic.Enabled && d.Cfg.Meshtastic.ExposeInInfo && d.Cfg.Meshtastic.ChannelName != "" {
-		fmt.Fprintf(&b, "\nMeshtastic: #%s (/mesh)", d.Cfg.Meshtastic.ChannelName)
+	if d.Cfg != nil && d.Cfg.Meshtastic.Enabled && d.Cfg.Meshtastic.ExposeInInfo {
+		chName := d.Cfg.Meshtastic.ChannelName
+		if d.MeshChannelName != nil {
+			if live := d.MeshChannelName(); live != "" {
+				chName = live
+			}
+		}
+		if chName != "" {
+			fmt.Fprintf(&b, "\nMeshtastic: #%s (/mesh)", chName)
+		} else if d.Cfg.Meshtastic.Mode == config.MeshtasticModeExternal {
+			b.WriteString("\nMeshtastic: bridged (/mesh)")
+		}
 	}
 
 	switch {

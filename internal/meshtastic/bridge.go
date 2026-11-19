@@ -17,6 +17,11 @@ import (
 )
 
 const (
+	// ModeInternal uses fwdsvc's built-in virtual Meshtastic node over UDP multicast and/or MQTT.
+	ModeInternal = "internal"
+	// ModeExternal connects via TCP StreamAPI to an external Meshtastic node (meshtasticd or Wi-Fi/Ethernet radio).
+	ModeExternal = "external"
+
 	meshDedupWindow      = time.Hour
 	meshDedupMaxEntries  = 10000
 	meshTxQueueCap       = 256
@@ -24,7 +29,7 @@ const (
 	nodeInfoReplyMinWait = 15 * time.Second
 )
 
-// Transport abstracts UDP multicast, MQTT, and test doubles.
+// Transport abstracts UDP multicast, MQTT, TCP StreamAPI, and test doubles.
 type Transport interface {
 	Name() string
 	Run(ctx context.Context, onPacket func(pkt *MeshPacket)) error
@@ -42,6 +47,7 @@ type InboundMessage struct {
 
 // BridgeConfig configures a Bridge instance.
 type BridgeConfig struct {
+	Mode             string // "internal" (default) or "external"
 	ChannelName      string
 	RawPSK           []byte
 	ExpandedKey      []byte
@@ -66,6 +72,9 @@ type BridgeConfig struct {
 	MQTTUsername string
 	MQTTPassword string
 	MQTTRoot     string
+
+	TCPAddr         string
+	TCPChannelIndex *int
 }
 
 // DeriveNodeID derives a deterministic non-reserved 32-bit Meshtastic node ID
@@ -81,7 +90,9 @@ func DeriveNodeID(hash []byte) uint32 {
 	return id
 }
 
-// Bridge connects fwdsvc to a Meshtastic channel over UDP multicast and/or MQTT.
+// Bridge connects fwdsvc to a Meshtastic channel either directly (internal mode
+// over UDP multicast and/or MQTT) or via an external Meshtastic node (external
+// mode over TCP StreamAPI).
 type Bridge struct {
 	cfg         BridgeConfig
 	channelHash uint8
@@ -89,8 +100,12 @@ type Bridge struct {
 	transports  []Transport
 	udp         *UDPTransport
 	mqtt        *MQTTTransport
+	tcp         *TCPTransport
 	onMessage   func(InboundMessage)
 	logger      *logging.Logger
+
+	extMu    sync.RWMutex
+	extState ExternalNodeState
 
 	nextPktID atomic.Uint32
 	txCh      chan *MeshPacket
@@ -107,11 +122,20 @@ type Bridge struct {
 // NewBridge constructs a Bridge and loads its persisted NodeDB. Call Run to
 // start transports, outbound pacing, and periodic NODEINFO announcements.
 func NewBridge(cfg BridgeConfig, onMessage func(InboundMessage), logger *logging.Logger) (*Bridge, error) {
-	if cfg.BridgeNodeID == 0 || cfg.BridgeNodeID == BroadcastAddr {
-		return nil, fmt.Errorf("meshtastic: invalid bridge node id 0x%08x", cfg.BridgeNodeID)
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if cfg.Mode == "" {
+		cfg.Mode = ModeInternal
 	}
-	if strings.TrimSpace(cfg.ChannelName) == "" {
-		return nil, fmt.Errorf("meshtastic: channel_name is required")
+	if cfg.Mode != ModeInternal && cfg.Mode != ModeExternal {
+		return nil, fmt.Errorf("meshtastic: invalid mode %q (want %q or %q)", cfg.Mode, ModeInternal, ModeExternal)
+	}
+	if cfg.Mode == ModeInternal {
+		if cfg.BridgeNodeID == 0 || cfg.BridgeNodeID == BroadcastAddr {
+			return nil, fmt.Errorf("meshtastic: invalid bridge node id 0x%08x", cfg.BridgeNodeID)
+		}
+		if strings.TrimSpace(cfg.ChannelName) == "" {
+			return nil, fmt.Errorf("meshtastic: channel_name is required")
+		}
 	}
 	if cfg.HopLimit == 0 {
 		cfg.HopLimit = 3
@@ -125,6 +149,14 @@ func NewBridge(cfg BridgeConfig, onMessage func(InboundMessage), logger *logging
 	if cfg.LongName == "" {
 		cfg.LongName = "Reticulum Bridge"
 	}
+	if cfg.TCPChannelIndex != nil {
+		idx := *cfg.TCPChannelIndex
+		if idx < 0 || idx > 7 {
+			return nil, fmt.Errorf("meshtastic: tcp channel_index must be 0..7 (got %d)", idx)
+		}
+		idxCopy := idx
+		cfg.TCPChannelIndex = &idxCopy
+	}
 
 	db, err := NewNodeDB(cfg.NodeDBPath)
 	if err != nil {
@@ -132,14 +164,16 @@ func NewBridge(cfg BridgeConfig, onMessage func(InboundMessage), logger *logging
 	}
 
 	b := &Bridge{
-		cfg:         cfg,
-		channelHash: ChannelHash(cfg.ChannelName, cfg.ExpandedKey),
-		nodedb:      db,
-		onMessage:   onMessage,
-		logger:      logger,
-		txCh:        make(chan *MeshPacket, meshTxQueueCap),
-		dedup:       make(map[uint64]time.Time),
-		now:         time.Now,
+		cfg:       cfg,
+		nodedb:    db,
+		onMessage: onMessage,
+		logger:    logger,
+		txCh:      make(chan *MeshPacket, meshTxQueueCap),
+		dedup:     make(map[uint64]time.Time),
+		now:       time.Now,
+	}
+	if cfg.Mode == ModeInternal {
+		b.channelHash = ChannelHash(cfg.ChannelName, cfg.ExpandedKey)
 	}
 
 	var seed [4]byte
@@ -153,23 +187,31 @@ func NewBridge(cfg BridgeConfig, onMessage func(InboundMessage), logger *logging
 		b.nextPktID.Store(uint32(time.Now().UnixNano()))
 	}
 
-	if cfg.UDPEnabled {
-		u := NewUDPTransport(cfg.UDPAddr, cfg.UDPIface, logger)
-		b.udp = u
-		b.transports = append(b.transports, u)
-	}
-	if cfg.MQTTEnabled {
-		m := NewMQTTTransport(
-			cfg.MQTTBroker,
-			cfg.MQTTUsername,
-			cfg.MQTTPassword,
-			cfg.MQTTRoot,
-			cfg.ChannelName,
-			FormatNodeHex(cfg.BridgeNodeID),
-			logger,
-		)
-		b.mqtt = m
-		b.transports = append(b.transports, m)
+	if cfg.Mode == ModeExternal {
+		t := NewTCPTransport(cfg.TCPAddr, cfg.ChannelName, cfg.TCPChannelIndex, logger)
+		t.onNodeInfo = b.handleExternalNodeInfo
+		t.onState = b.handleExternalState
+		b.tcp = t
+		b.transports = append(b.transports, t)
+	} else {
+		if cfg.UDPEnabled {
+			u := NewUDPTransport(cfg.UDPAddr, cfg.UDPIface, logger)
+			b.udp = u
+			b.transports = append(b.transports, u)
+		}
+		if cfg.MQTTEnabled {
+			m := NewMQTTTransport(
+				cfg.MQTTBroker,
+				cfg.MQTTUsername,
+				cfg.MQTTPassword,
+				cfg.MQTTRoot,
+				cfg.ChannelName,
+				FormatNodeHex(cfg.BridgeNodeID),
+				logger,
+			)
+			b.mqtt = m
+			b.transports = append(b.transports, m)
+		}
 	}
 
 	return b, nil
@@ -189,14 +231,122 @@ func (b *Bridge) SetTransports(transports ...Transport) {
 	b.transports = append([]Transport(nil), transports...)
 }
 
+// Mode returns the configured bridge mode ("internal" or "external").
+func (b *Bridge) Mode() string { return b.cfg.Mode }
+
+func (b *Bridge) isExternal() bool { return b.cfg.Mode == ModeExternal }
+
+// TCPTransport returns the external-mode TCPTransport, or nil in internal mode.
+func (b *Bridge) TCPTransport() *TCPTransport { return b.tcp }
+
 // NodeDB returns the bridge's node database (used by /ban, /unban, /mesh).
 func (b *Bridge) NodeDB() *NodeDB { return b.nodedb }
 
 // ChannelHash returns the 8-bit Meshtastic channel hash for the bridged channel.
-func (b *Bridge) ChannelHash() uint8 { return b.channelHash }
+func (b *Bridge) ChannelHash() uint8 {
+	if b.isExternal() {
+		st := b.externalState()
+		if st.ChannelResolved {
+			if h, ok := externalChannelHash(st); ok {
+				return h
+			}
+		}
+		return 0
+	}
+	return b.channelHash
+}
 
-// BridgeNodeID returns the virtual Meshtastic node ID used for outbound packets.
-func (b *Bridge) BridgeNodeID() uint32 { return b.cfg.BridgeNodeID }
+// ChannelName returns the active bridged channel name (learned from the external
+// node once connected in external mode, or the configured channel_name).
+func (b *Bridge) ChannelName() string {
+	if b.isExternal() {
+		st := b.externalState()
+		if st.ChannelName != "" {
+			return st.ChannelName
+		}
+	}
+	return b.cfg.ChannelName
+}
+
+// BridgeNodeID returns the virtual node ID (internal mode) or the connected
+// external node's ID (external mode; 0 until handshake completes).
+func (b *Bridge) BridgeNodeID() uint32 {
+	if b.isExternal() {
+		b.extMu.RLock()
+		id := b.extState.NodeID
+		b.extMu.RUnlock()
+		return id
+	}
+	return b.cfg.BridgeNodeID
+}
+
+// StartupSummary returns a single-line startup log summary for Service.Run.
+func (b *Bridge) StartupSummary() string {
+	if b.isExternal() {
+		addr := DefaultTCPAddr
+		if b.tcp != nil {
+			addr = b.tcp.Addr()
+		} else if b.cfg.TCPAddr != "" {
+			addr = b.cfg.TCPAddr
+		}
+		switch {
+		case b.cfg.TCPChannelIndex != nil:
+			return fmt.Sprintf("mode=external tcp=%s channel_index=%d", addr, *b.cfg.TCPChannelIndex)
+		case b.cfg.ChannelName != "":
+			return fmt.Sprintf("mode=external tcp=%s channel=#%s", addr, b.cfg.ChannelName)
+		default:
+			return fmt.Sprintf("mode=external tcp=%s channel=primary", addr)
+		}
+	}
+	return fmt.Sprintf("mode=internal #%s (hash=0x%02x node=%s)",
+		b.cfg.ChannelName, b.channelHash, FormatNodeBang(b.cfg.BridgeNodeID))
+}
+
+func (b *Bridge) externalState() ExternalNodeState {
+	b.extMu.RLock()
+	st := cloneExternalNodeState(b.extState)
+	b.extMu.RUnlock()
+	return st
+}
+
+func (b *Bridge) handleExternalState(st ExternalNodeState) {
+	b.extMu.Lock()
+	b.extState = cloneExternalNodeState(st)
+	b.extMu.Unlock()
+}
+
+func (b *Bridge) handleExternalNodeInfo(ni *NodeInfo) {
+	if ni == nil || ni.Num == 0 || ni.Num == BroadcastAddr || ni.User == nil {
+		return
+	}
+	if !isValidUserStrings(ni.User) {
+		return
+	}
+	if myID := b.BridgeNodeID(); myID != 0 && ni.Num == myID {
+		return
+	}
+	var seenAt time.Time
+	// Match PhoneAPI.cpp MIN_PLAUSIBLE_EPOCH (2020-01-01): ignore uptime-only counters.
+	if ni.LastHeard >= 1577836800 {
+		seenAt = time.Unix(int64(ni.LastHeard), 0)
+	}
+	b.nodedb.UpdateUser(ni.Num, ni.User.ShortName, ni.User.LongName, seenAt)
+}
+
+func externalChannelHash(st ExternalNodeState) (uint8, bool) {
+	if !st.ChannelResolved || st.ChannelName == "" {
+		return 0, false
+	}
+	exp, err := ExpandPSK(st.RawPSK)
+	if err != nil {
+		return 0, false
+	}
+	h := ChannelHash(st.ChannelName, exp)
+	if st.UseAEAD {
+		h ^= 0xAE
+	}
+	return h, true
+}
 
 // FormatSenderLabel formats a Meshtastic sender node ID according to config.
 func (b *Bridge) FormatSenderLabel(nodeID uint32) string {
@@ -234,7 +384,7 @@ func (b *Bridge) Run(ctx context.Context) {
 		b.runTxLoop(ctx, txQueues)
 	}()
 
-	if b.cfg.NodeInfoInterval > 0 {
+	if !b.isExternal() && b.cfg.NodeInfoInterval > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -351,9 +501,9 @@ func (b *Bridge) runNodeInfoLoop(ctx context.Context) {
 	}
 }
 
-// SendText chunks or truncates text per policy, constructs encrypted MeshPackets
-// with pre-assigned packet IDs, queues them for paced transmission, and returns
-// the assigned packet IDs immediately (for idmap registration).
+// SendText chunks or truncates text per policy, constructs MeshPackets with
+// pre-assigned packet IDs, queues them for paced transmission, and returns the
+// assigned packet IDs immediately (for idmap registration).
 func (b *Bridge) SendText(text string, replyToPacketID uint32) []uint32 {
 	chunks := SplitMessage(text, b.cfg.LongMessageMode, b.cfg.MaxChunks, MaxMeshPayloadBytes)
 	if len(chunks) == 0 {
@@ -365,13 +515,16 @@ func (b *Bridge) SendText(text string, replyToPacketID uint32) []uint32 {
 		if i == 0 {
 			replyID = replyToPacketID
 		}
-		pkt, err := b.buildDataPacket(BroadcastAddr, &Data{
-			Portnum:     PortNumTextMessageApp,
-			Payload:     []byte(chunk),
-			ReplyID:     replyID,
-			Bitfield:    b.txBitfield(),
-			HasBitfield: true,
-		})
+		d := &Data{
+			Portnum: PortNumTextMessageApp,
+			Payload: []byte(chunk),
+			ReplyID: replyID,
+		}
+		if !b.isExternal() {
+			d.Bitfield = b.txBitfield()
+			d.HasBitfield = true
+		}
+		pkt, err := b.buildDataPacket(BroadcastAddr, d)
 		if err != nil {
 			if b.logger != nil {
 				b.logger.Errorf("meshtastic build text packet: %v", err)
@@ -390,14 +543,17 @@ func (b *Bridge) SendReaction(emoji string, replyToPacketID uint32) uint32 {
 	if emoji == "" || replyToPacketID == 0 {
 		return 0
 	}
-	pkt, err := b.buildDataPacket(BroadcastAddr, &Data{
-		Portnum:     PortNumTextMessageApp,
-		Payload:     []byte(emoji),
-		ReplyID:     replyToPacketID,
-		Emoji:       1,
-		Bitfield:    b.txBitfield(),
-		HasBitfield: true,
-	})
+	d := &Data{
+		Portnum: PortNumTextMessageApp,
+		Payload: []byte(emoji),
+		ReplyID: replyToPacketID,
+		Emoji:   1,
+	}
+	if !b.isExternal() {
+		d.Bitfield = b.txBitfield()
+		d.HasBitfield = true
+	}
+	pkt, err := b.buildDataPacket(BroadcastAddr, d)
 	if err != nil {
 		if b.logger != nil {
 			b.logger.Errorf("meshtastic build reaction packet: %v", err)
@@ -411,7 +567,12 @@ func (b *Bridge) SendReaction(emoji string, replyToPacketID uint32) uint32 {
 }
 
 // SendNodeInfo queues a NODEINFO_APP packet describing the virtual bridge node.
+// In external mode this is a no-op because the external Meshtastic node manages
+// its own NodeInfo broadcasts.
 func (b *Bridge) SendNodeInfo(toNode uint32, requestID uint32) uint32 {
+	if b.isExternal() {
+		return 0
+	}
 	u := &User{
 		ID:        FormatNodeBang(b.cfg.BridgeNodeID),
 		LongName:  truncateUTF8(b.cfg.LongName, 39, false),
@@ -455,6 +616,15 @@ func (b *Bridge) allocPacketID() uint32 {
 
 func (b *Bridge) buildDataPacket(toNode uint32, data *Data) (*MeshPacket, error) {
 	pktID := b.allocPacketID()
+	if b.isExternal() {
+		// External Meshtastic node encrypts, signs, stamps From, and maps Channel index.
+		return &MeshPacket{
+			To:       toNode,
+			ID:       pktID,
+			HopLimit: b.cfg.HopLimit,
+			Decoded:  data,
+		}, nil
+	}
 	rawData := data.Marshal()
 	pkt := &MeshPacket{
 		From:     b.cfg.BridgeNodeID,
@@ -488,10 +658,15 @@ func (b *Bridge) enqueueTx(pkt *MeshPacket) bool {
 	}
 }
 
-// handleInboundPacket processes a packet received from either UDP or MQTT.
-// It enforces strict endpoint semantics (dedup, ignore self, channel match,
-// decrypt, ban check) and never forwards packets between UDP and MQTT.
+// handleInboundPacket processes a packet received from UDP/MQTT (internal mode)
+// or TCP StreamAPI (external mode). It enforces strict endpoint semantics
+// (dedup, ignore self, channel match, decrypt/decoded check, ban check) and
+// never cross-relays between transports.
 func (b *Bridge) handleInboundPacket(pkt *MeshPacket) {
+	if b.isExternal() {
+		b.handleExternalInboundPacket(pkt)
+		return
+	}
 	if pkt == nil || pkt.From == 0 || pkt.ID == 0 {
 		return
 	}
@@ -530,34 +705,77 @@ func (b *Bridge) handleInboundPacket(pkt *MeshPacket) {
 			b.maybeReplyNodeInfo(pkt.From, pkt.ID, now)
 		}
 	case PortNumTextMessageApp:
-		// Only bridge broadcast channel messages; never leak DMs into group chat.
-		if pkt.To != BroadcastAddr {
+		b.deliverInboundText(pkt, data, now)
+	}
+}
+
+func (b *Bridge) handleExternalInboundPacket(pkt *MeshPacket) {
+	if pkt == nil || pkt.From == 0 || pkt.ID == 0 || pkt.Decoded == nil {
+		return
+	}
+	st := b.externalState()
+	if st.NodeID != 0 && pkt.From == st.NodeID {
+		return
+	}
+	now := b.now()
+	if b.isSeen(pkt.From, pkt.ID, now) {
+		return
+	}
+
+	data := pkt.Decoded
+	switch data.Portnum {
+	case PortNumNodeInfoApp:
+		// NodeInfo is node-global across channels on an external Meshtastic node.
+		user, uerr := UnmarshalUser(data.Payload)
+		if uerr != nil {
 			return
 		}
-		if len(data.Payload) == 0 || bytes.IndexByte(data.Payload, 0) >= 0 || !utf8.Valid(data.Payload) {
+		if !isValidUserStrings(user) {
 			return
 		}
 		b.markSeen(pkt.From, pkt.ID, now)
-		if b.nodedb.IsBanned(pkt.From) {
-			if b.logger != nil {
-				b.logger.Infof("meshtastic dropping message from banned node %s", FormatNodeBang(pkt.From))
-			}
+		b.nodedb.UpdateUser(pkt.From, user.ShortName, user.LongName, now)
+		if b.logger != nil {
+			b.logger.Debugf("meshtastic inbound nodeinfo: from=%s short=%q long=%q",
+				FormatNodeBang(pkt.From), user.ShortName, user.LongName)
+		}
+	case PortNumTextMessageApp:
+		// Over PhoneAPI, pkt.Channel is the local channel index (0..7), never the hash.
+		if !st.ChannelResolved || pkt.Channel != st.ChannelIndex {
 			return
 		}
-		b.nodedb.Touch(pkt.From, now)
+		b.deliverInboundText(pkt, data, now)
+	}
+}
+
+func (b *Bridge) deliverInboundText(pkt *MeshPacket, data *Data, now time.Time) {
+	// Only bridge broadcast channel messages; never leak DMs into group chat.
+	if pkt.To != BroadcastAddr {
+		return
+	}
+	if len(data.Payload) == 0 || bytes.IndexByte(data.Payload, 0) >= 0 || !utf8.Valid(data.Payload) {
+		return
+	}
+	b.markSeen(pkt.From, pkt.ID, now)
+	if b.nodedb.IsBanned(pkt.From) {
 		if b.logger != nil {
-			b.logger.Infof("meshtastic inbound text: from=%s pkt_id=0x%08x len=%d via_mqtt=%v",
-				FormatNodeBang(pkt.From), pkt.ID, len(data.Payload), pkt.ViaMQTT)
+			b.logger.Infof("meshtastic dropping message from banned node %s", FormatNodeBang(pkt.From))
 		}
-		if b.onMessage != nil {
-			b.onMessage(InboundMessage{
-				From:     pkt.From,
-				PacketID: pkt.ID,
-				Text:     string(data.Payload),
-				ReplyID:  data.ReplyID,
-				Emoji:    data.Emoji,
-			})
-		}
+		return
+	}
+	b.nodedb.Touch(pkt.From, now)
+	if b.logger != nil {
+		b.logger.Infof("meshtastic inbound text: from=%s pkt_id=0x%08x len=%d via_mqtt=%v",
+			FormatNodeBang(pkt.From), pkt.ID, len(data.Payload), pkt.ViaMQTT)
+	}
+	if b.onMessage != nil {
+		b.onMessage(InboundMessage{
+			From:     pkt.From,
+			PacketID: pkt.ID,
+			Text:     string(data.Payload),
+			ReplyID:  data.ReplyID,
+			Emoji:    data.Emoji,
+		})
 	}
 }
 
@@ -635,37 +853,88 @@ func (b *Bridge) markSeen(from, pktID uint32, now time.Time) {
 // shareable URL) are included ONLY when includeSecrets is true (RoleAdmin).
 func (b *Bridge) StatusSummary(includeSecrets bool) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "Meshtastic Bridge: #%s (hash 0x%02x)\n", b.cfg.ChannelName, b.channelHash)
-	fmt.Fprintf(&out, "Bridge node: %s (%s / %s)\n",
-		FormatNodeBang(b.cfg.BridgeNodeID), b.cfg.ShortName, b.cfg.LongName)
-
-	var trParts []string
-	if b.udp != nil {
-		addr := b.cfg.UDPAddr
-		if addr == "" {
-			addr = DefaultUDPAddr
+	if b.isExternal() {
+		st := b.externalState()
+		switch {
+		case st.ChannelResolved:
+			if h, ok := externalChannelHash(st); ok {
+				fmt.Fprintf(&out, "Meshtastic Bridge: #%s (mode external, ch %d, hash 0x%02x)\n", st.ChannelName, st.ChannelIndex, h)
+			} else {
+				fmt.Fprintf(&out, "Meshtastic Bridge: #%s (mode external, ch %d)\n", st.ChannelName, st.ChannelIndex)
+			}
+		case st.Connected && st.ChannelError != "":
+			fmt.Fprintf(&out, "Meshtastic Bridge: (mode external, %s)\n", st.ChannelError)
+		case b.cfg.ChannelName != "":
+			fmt.Fprintf(&out, "Meshtastic Bridge: #%s (mode external, connecting)\n", b.cfg.ChannelName)
+		case b.cfg.TCPChannelIndex != nil:
+			fmt.Fprintf(&out, "Meshtastic Bridge: ch %d (mode external, connecting)\n", *b.cfg.TCPChannelIndex)
+		default:
+			out.WriteString("Meshtastic Bridge: (mode external, connecting)\n")
 		}
-		trParts = append(trParts, fmt.Sprintf("UDP(%s)", addr))
-	}
-	if b.mqtt != nil {
+
+		if st.NodeID != 0 {
+			if st.ShortName != "" || st.LongName != "" {
+				fmt.Fprintf(&out, "External node: %s (%s / %s)\n", FormatNodeBang(st.NodeID), st.ShortName, st.LongName)
+			} else {
+				fmt.Fprintf(&out, "External node: %s\n", FormatNodeBang(st.NodeID))
+			}
+		} else {
+			out.WriteString("External node: (not connected)\n")
+		}
+
+		addr := DefaultTCPAddr
 		state := "connecting"
-		if b.mqtt.Connected() {
-			state = "connected"
+		if b.tcp != nil {
+			addr = b.tcp.Addr()
+			if b.tcp.Connected() {
+				state = "connected"
+			}
+		} else if b.cfg.TCPAddr != "" {
+			addr = b.cfg.TCPAddr
 		}
-		trParts = append(trParts, fmt.Sprintf("MQTT(%s, %s)", b.cfg.MQTTBroker, state))
-	}
-	if len(trParts) == 0 {
-		trParts = append(trParts, "none")
-	}
-	fmt.Fprintf(&out, "Transports: %s", strings.Join(trParts, ", "))
+		fmt.Fprintf(&out, "Transports: TCP(%s, %s)", addr, state)
 
-	if includeSecrets {
-		pskDisplay := "none"
-		if len(b.cfg.RawPSK) > 0 {
-			pskDisplay = base64.StdEncoding.EncodeToString(b.cfg.RawPSK)
+		if includeSecrets && st.ChannelResolved {
+			pskDisplay := "none"
+			if len(st.RawPSK) > 0 {
+				pskDisplay = base64.StdEncoding.EncodeToString(st.RawPSK)
+			}
+			fmt.Fprintf(&out, "\nPSK: %s", pskDisplay)
+			fmt.Fprintf(&out, "\nURL: %s", FormatChannelURL(st.ChannelName, st.RawPSK))
 		}
-		fmt.Fprintf(&out, "\nPSK: %s", pskDisplay)
-		fmt.Fprintf(&out, "\nURL: %s", FormatChannelURL(b.cfg.ChannelName, b.cfg.RawPSK))
+	} else {
+		fmt.Fprintf(&out, "Meshtastic Bridge: #%s (hash 0x%02x)\n", b.cfg.ChannelName, b.channelHash)
+		fmt.Fprintf(&out, "Bridge node: %s (%s / %s)\n",
+			FormatNodeBang(b.cfg.BridgeNodeID), b.cfg.ShortName, b.cfg.LongName)
+
+		var trParts []string
+		if b.udp != nil {
+			addr := b.cfg.UDPAddr
+			if addr == "" {
+				addr = DefaultUDPAddr
+			}
+			trParts = append(trParts, fmt.Sprintf("UDP(%s)", addr))
+		}
+		if b.mqtt != nil {
+			state := "connecting"
+			if b.mqtt.Connected() {
+				state = "connected"
+			}
+			trParts = append(trParts, fmt.Sprintf("MQTT(%s, %s)", b.cfg.MQTTBroker, state))
+		}
+		if len(trParts) == 0 {
+			trParts = append(trParts, "none")
+		}
+		fmt.Fprintf(&out, "Transports: %s", strings.Join(trParts, ", "))
+
+		if includeSecrets {
+			pskDisplay := "none"
+			if len(b.cfg.RawPSK) > 0 {
+				pskDisplay = base64.StdEncoding.EncodeToString(b.cfg.RawPSK)
+			}
+			fmt.Fprintf(&out, "\nPSK: %s", pskDisplay)
+			fmt.Fprintf(&out, "\nURL: %s", FormatChannelURL(b.cfg.ChannelName, b.cfg.RawPSK))
+		}
 	}
 
 	recent := b.nodedb.RecentNodes(10)
