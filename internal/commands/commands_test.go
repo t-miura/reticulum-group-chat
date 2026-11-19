@@ -990,6 +990,48 @@ func TestAnnounceCallsHook(t *testing.T) {
 	}
 }
 
+func TestSyncRequiresModAndCallsHook(t *testing.T) {
+	d := newDispatcher(t)
+	d.Cfg.Propagation = config.PropagationConfig{
+		Enabled:      true,
+		SyncInterval: config.Duration(5 * time.Minute),
+	}
+	called := 0
+	d.SyncPropagation = func() string {
+		called++
+		return "Propagation sync triggered (node aabbccdd)."
+	}
+
+	// Regular user is denied and does not see /sync in /?.
+	out := d.Dispatch(userHash, Parse("/sync"))
+	if !strings.Contains(strings.ToLower(out), "only mods or admins") {
+		t.Errorf("/sync as user = %q, want permission denial", out)
+	}
+	if help := d.Dispatch(userHash, Parse("/?")); strings.Contains(help, "/sync") {
+		t.Errorf("user /? should not advertise /sync: %q", help)
+	}
+
+	// Mod and admin can run /sync and see it in /?.
+	for _, caller := range []string{modHash, adminHash} {
+		out = d.Dispatch(caller, Parse("/sync"))
+		if !strings.Contains(out, "Propagation sync triggered") {
+			t.Errorf("/sync as %s = %q, want trigger reply", caller[:8], out)
+		}
+		if help := d.Dispatch(caller, Parse("/?")); !strings.Contains(help, "/sync") {
+			t.Errorf("%s /? should advertise /sync when enabled: %q", caller[:8], help)
+		}
+	}
+	if called != 2 {
+		t.Errorf("SyncPropagation called %d times, want 2", called)
+	}
+
+	// Help omits /sync when propagation sync is disabled.
+	d.Cfg.Propagation.SyncInterval = 0
+	if help := d.Dispatch(modHash, Parse("/?")); strings.Contains(help, "/sync") {
+		t.Errorf("mod /? should omit /sync when sync_interval=0: %q", help)
+	}
+}
+
 // TestAboutCommandReturnsVersionAndRepo pins the /about reply shape:
 // the running Version constant and the canonical RepoURL must both
 // appear so users running an unfamiliar deployment can identify it

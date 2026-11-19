@@ -215,11 +215,14 @@ max_age = "7d"
 pins_on_join = true
 
 [propagation]
-# Store-and-forward delivery via LXMF propagation nodes. When enabled,
-# messages the service can't deliver directly (recipient offline or
-# unreachable) are handed to a propagation node; the recipient's client
-# (Sideband etc.) picks them up on its next sync instead of the message
-# being dropped after the direct retry budget runs out.
+# Store-and-forward delivery and retrieval via LXMF propagation nodes.
+# When enabled:
+#   - Outbound: messages the service can't deliver directly (mode "fallback")
+#     or all outbound messages (mode "always") are handed to a propagation
+#     node for offline members to pick up on their next sync.
+#   - Inbound: when sync_interval > 0, the service periodically polls the
+#     propagation node via /get (SPEC §5.8.3) to retrieve messages sent to
+#     this group while it was unreachable or via propagated delivery.
 enabled = false
 
 # Delivery strategy:
@@ -228,6 +231,9 @@ enabled = false
 #   "always" — every outbound message goes to the propagation node only;
 #     members receive everything on their next sync (higher latency, but
 #     nothing is ever dropped for being offline).
+#   "receive_only" — keep outbound delivery direct-only and use the
+#     propagation node strictly for inbound /get retrieval (requires
+#     sync_interval > 0).
 mode = "fallback"
 
 # IMPORTANT: in fallback mode the direct retry budget is SPLIT, and this
@@ -242,6 +248,27 @@ mode = "fallback"
 # The startup log prints both numbers. Set to 5 to disable the
 # shortening and always use the full budget.
 direct_attempts = 3
+
+# How often to poll the propagation node via /get for inbound messages
+# addressed to this group. Default "5m" (polite for shared/public nodes).
+# Set to "0" to disable inbound retrieval (outbound-only). Minimum "10s"
+# when enabled (lower values are rejected to avoid triggering 0xf6
+# throttling on peered nodes; point at your own LXMd if using short intervals).
+sync_interval = "5m"
+
+# Per-round /get download budget in KB (default 512, max 960). Kept below
+# fwdsvc's single-segment Resource limit (~1 MiB) so large backlogs paginate
+# cleanly across rounds instead of being rejected.
+sync_transfer_limit_kb = 512
+
+# Maximum messages requested per /get round (default 32). Backlogs larger
+# than this drain across consecutive rounds within one sync cycle.
+sync_max_messages = 32
+
+# Per-request timeout for each /get RPC round (list, download, purge).
+# Default "2m" so multi-hop Resource downloads up to sync_transfer_limit_kb
+# complete cleanly.
+sync_timeout = "2m"
 
 # Optional: pin a specific propagation node by its lxmf.propagation
 # destination hash (32 hex chars).

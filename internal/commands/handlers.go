@@ -68,6 +68,11 @@ type Dispatcher struct {
 	// an immediate fresh announce broadcast. Mod/admin only.
 	Announce func() error
 
+	// SyncPropagation, when set, is invoked by the /sync command to trigger
+	// an immediate propagation-node /get retrieval cycle without blocking.
+	// Mod/admin only.
+	SyncPropagation func() string
+
 	// PathLookup, when set, is invoked by the /path command to query the
 	// transport for routing info on a target dest_hash (lowercase hex,
 	// 32 chars). Returns PathInfo{Known:false} if the destination has
@@ -181,6 +186,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handleUnban(caller.Role, parsed.Args)
 	case "announce":
 		return d.handleAnnounce(caller.Role)
+	case "sync":
+		return d.handleSync(caller.Role)
 	case "path":
 		return d.handlePath(caller.Role, parsed.Args)
 	default:
@@ -270,14 +277,15 @@ func aboutText() string {
 
 func (d *Dispatcher) renderHelp(c *Caller) string {
 	showMesh := d.Cfg != nil && d.Cfg.Meshtastic.Enabled && d.Cfg.Meshtastic.ExposeInInfo && (c.Member || c.Role.atLeastMod())
-	return helpTextWithMesh(c, showMesh)
+	showSync := d.Cfg != nil && d.Cfg.Propagation.Enabled && d.Cfg.Propagation.SyncInterval.Std() > 0
+	return helpTextWithOptions(c, showMesh, showSync)
 }
 
 func helpText(c *Caller) string {
-	return helpTextWithMesh(c, false)
+	return helpTextWithOptions(c, false, false)
 }
 
-func helpTextWithMesh(c *Caller, showMesh bool) string {
+func helpTextWithOptions(c *Caller, showMesh, showSync bool) string {
 	var b strings.Builder
 	b.WriteString("Commands:\n")
 	b.WriteString("/?, /help\n")
@@ -303,7 +311,11 @@ func helpTextWithMesh(c *Caller, showMesh bool) string {
 		b.WriteString("/kick /ban /unban /path USER - mod\n")
 		b.WriteString("/adduser HASH /removeuser USER - mod\n")
 		b.WriteString("/pin TEXT /unpin N - mod\n")
-		b.WriteString("/announce - mod\n")
+		if showSync {
+			b.WriteString("/announce /sync - mod\n")
+		} else {
+			b.WriteString("/announce - mod\n")
+		}
 		if c.Role == RoleAdmin {
 			b.WriteString("/setinfo TEXT - admin\n")
 			b.WriteString("/usermode ROLE USER - admin\n")
@@ -977,6 +989,16 @@ func (d *Dispatcher) handleAnnounce(role Role) string {
 		return "Announce failed: " + err.Error()
 	}
 	return "OK, announced."
+}
+
+func (d *Dispatcher) handleSync(role Role) string {
+	if !role.atLeastMod() {
+		return "Only mods or admins can /sync."
+	}
+	if d.SyncPropagation == nil {
+		return "Propagation sync is not enabled on this service."
+	}
+	return d.SyncPropagation()
 }
 
 // scrubControlBytes replaces every C0 control byte (0x00-0x1F except TAB,

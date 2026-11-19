@@ -294,6 +294,116 @@ func TestPropagationDefaults(t *testing.T) {
 	if d.NodeBytes() != nil {
 		t.Error("NodeBytes with no pinned node should be nil")
 	}
+	if d.SyncInterval.Std() != DefaultPropagationSyncInterval {
+		t.Errorf("SyncInterval default = %s, want %s", d.SyncInterval.Std(), DefaultPropagationSyncInterval)
+	}
+	if d.SyncTransferLimitKB != DefaultPropagationSyncTransferLimitKB {
+		t.Errorf("SyncTransferLimitKB default = %d, want %d", d.SyncTransferLimitKB, DefaultPropagationSyncTransferLimitKB)
+	}
+	if d.SyncMaxMessages != DefaultPropagationSyncMaxMessages {
+		t.Errorf("SyncMaxMessages default = %d, want %d", d.SyncMaxMessages, DefaultPropagationSyncMaxMessages)
+	}
+	if d.SyncTimeout.Std() != DefaultPropagationSyncTimeout {
+		t.Errorf("SyncTimeout default = %s, want %s", d.SyncTimeout.Std(), DefaultPropagationSyncTimeout)
+	}
+}
+
+func TestPropagationSyncTOMLBindingAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sync.toml")
+	body := "[service]\ndisplay_name = \"x\"\n" +
+		"[propagation]\nenabled = true\nmode = \"Receive_Only\"\n" +
+		"sync_interval = \"30s\"\nsync_transfer_limit_kb = 768\n" +
+		"sync_max_messages = 16\nsync_timeout = \"90s\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", c.Warnings)
+	}
+	if c.Propagation.Mode != PropagationModeReceiveOnly {
+		t.Errorf("Mode = %q, want %q", c.Propagation.Mode, PropagationModeReceiveOnly)
+	}
+	if c.Propagation.SyncInterval.Std() != 30*time.Second {
+		t.Errorf("SyncInterval = %s, want 30s", c.Propagation.SyncInterval.Std())
+	}
+	if c.Propagation.SyncTransferLimitKB != 768 {
+		t.Errorf("SyncTransferLimitKB = %d, want 768", c.Propagation.SyncTransferLimitKB)
+	}
+	if c.Propagation.SyncMaxMessages != 16 {
+		t.Errorf("SyncMaxMessages = %d, want 16", c.Propagation.SyncMaxMessages)
+	}
+	if c.Propagation.SyncTimeout.Std() != 90*time.Second {
+		t.Errorf("SyncTimeout = %s, want 90s", c.Propagation.SyncTimeout.Std())
+	}
+
+	// sync_interval = "0" explicitly disables inbound sync in fallback/always mode.
+	disabledPath := filepath.Join(dir, "disabled.toml")
+	disabledBody := "[service]\ndisplay_name = \"x\"\n[propagation]\nenabled = true\nsync_interval = \"0\"\n"
+	if err := os.WriteFile(disabledPath, []byte(disabledBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dc, err := Load(disabledPath)
+	if err != nil {
+		t.Fatalf("Load disabled sync: %v", err)
+	}
+	if dc.Propagation.SyncInterval.Std() != 0 {
+		t.Errorf("SyncInterval = %s, want 0 (disabled)", dc.Propagation.SyncInterval.Std())
+	}
+
+	// Minimum floor of 10s when non-zero.
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Propagation.SyncInterval = Duration(5 * time.Second)
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject sync_interval < 10s")
+	}
+	cfg.Propagation.SyncInterval = Duration(MinPropagationSyncInterval)
+	if err := cfg.normalize(); err != nil {
+		t.Errorf("sync_interval = 10s should be accepted: %v", err)
+	}
+
+	// Negative sync_interval rejected.
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.SyncInterval = Duration(-time.Second)
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject negative sync_interval")
+	}
+
+	// receive_only with sync_interval = 0 rejected when enabled.
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.Enabled = true
+	cfg.Propagation.Mode = PropagationModeReceiveOnly
+	cfg.Propagation.SyncInterval = 0
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject receive_only mode with sync_interval = 0")
+	}
+
+	// Over-limit transfer cap rejected (> 960 KB single-segment guard).
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.SyncTransferLimitKB = MaxPropagationSyncTransferLimitKB + 1
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject sync_transfer_limit_kb > 960")
+	}
+	cfg.Propagation.SyncTransferLimitKB = -1
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject negative sync_transfer_limit_kb")
+	}
+
+	// Negative max_messages / timeout rejected.
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.SyncMaxMessages = -1
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject negative sync_max_messages")
+	}
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.SyncTimeout = Duration(-time.Second)
+	if err := cfg.normalize(); err == nil {
+		t.Error("expected normalize to reject negative sync_timeout")
+	}
 }
 
 func TestPropagationTOMLBinding(t *testing.T) {

@@ -53,29 +53,37 @@ type Config struct {
 	Warnings []string `toml:"-"`
 }
 
-// PropagationConfig controls store-and-forward delivery via LXMF
-// propagation nodes (SPEC §5.8). When enabled, messages the service
-// can't deliver directly (recipient offline / unreachable) are handed
-// to a propagation node, where the recipient's own client (Sideband
-// etc.) fetches them on its next sync — instead of being dropped after
-// the direct-retry budget is exhausted.
+// PropagationConfig controls store-and-forward delivery and retrieval
+// via LXMF propagation nodes (SPEC §5.8). When enabled:
+//   - Outbound: messages the service can't deliver directly (mode
+//     "fallback") or all outbound messages (mode "always") are handed
+//     to a propagation node for recipients to collect on their next sync.
+//   - Inbound: when sync_interval > 0, the service periodically polls
+//     the propagation node via /get (SPEC §5.8.3) to retrieve messages
+//     addressed to this group while it was unreachable or sent via
+//     propagated delivery.
 type PropagationConfig struct {
-	// Enabled turns propagation-node submission on. Default false —
-	// existing deployments keep the direct-only behavior.
+	// Enabled turns propagation-node support (outbound submission and/or
+	// inbound sync) on. Default false — existing deployments keep the
+	// direct-only behavior.
 	Enabled bool `toml:"enabled"`
 
 	// Node optionally pins one propagation node by destination hash
 	// (32 hex chars, the lxmf.propagation destination). When empty, the
-	// service auto-selects the most recently heard node that announces
-	// itself as accepting messages.
+	// service auto-selects the longest-known fresh node that announces
+	// itself as accepting messages. Used for both outbound submission
+	// and inbound /get sync.
 	Node string `toml:"node"`
 
-	// Mode selects when propagation is used:
+	// Mode selects how outbound propagation is used:
 	//   "fallback" (default) — try direct delivery first; when the
 	//     direct retry budget is exhausted, re-route the message via the
 	//     propagation node instead of dropping it.
 	//   "always" — every outbound message goes to the propagation node
 	//     only; recipients get everything on their next sync.
+	//   "receive_only" — keep outbound sends direct-only and use the
+	//     propagation node strictly for inbound /get retrieval (requires
+	//     sync_interval > 0).
 	Mode string `toml:"mode"`
 
 	// DirectAttempts SHORTENS the direct-delivery retry budget — but
@@ -90,12 +98,39 @@ type PropagationConfig struct {
 	// Only meaningful in mode "fallback". Default 3. Values >= 5
 	// disable the shortening (the standard budget wins).
 	DirectAttempts int `toml:"direct_attempts"`
+
+	// SyncInterval controls how often fwdsvc polls the propagation node
+	// via /get (SPEC §5.8.3) to retrieve inbound messages held for this
+	// service. Default 5m when propagation.enabled is true; "0" disables
+	// inbound retrieval (outbound-only). Minimum 10s when non-zero to
+	// avoid hammering peered propagation nodes and triggering 0xf6
+	// throttling.
+	SyncInterval Duration `toml:"sync_interval"`
+
+	// SyncTransferLimitKB caps the total size (in KB) the propagation
+	// node packs into one /get response (element [2] of /get). Must stay
+	// below fwdsvc's single-segment Resource ceiling (~1 MiB) so large
+	// backlogs paginate cleanly across rounds rather than being rejected
+	// by SetMaxResourceSegments(1). Default 512 (KB); max 960.
+	SyncTransferLimitKB int `toml:"sync_transfer_limit_kb"`
+
+	// SyncMaxMessages caps how many messages are requested per /get
+	// round. Larger backlogs drain across consecutive rounds within one
+	// sync cycle. Default 32.
+	SyncMaxMessages int `toml:"sync_max_messages"`
+
+	// SyncTimeout bounds each individual /get RPC round (list, download,
+	// purge). Sized generously above rns.DefaultRequestTimeout (30s) so
+	// multi-hop Resource downloads up to SyncTransferLimitKB complete
+	// without timing out mid-transfer. Default 2m.
+	SyncTimeout Duration `toml:"sync_timeout"`
 }
 
 // Propagation mode values accepted in PropagationConfig.Mode.
 const (
-	PropagationModeFallback = "fallback"
-	PropagationModeAlways   = "always"
+	PropagationModeFallback    = "fallback"
+	PropagationModeAlways      = "always"
+	PropagationModeReceiveOnly = "receive_only"
 )
 
 // Reserved LXMF field keys the relay stamps itself (see
@@ -122,6 +157,20 @@ const MaxAnnouncedStampCost = 254
 // while a propagation fallback node is available. Applied by normalize
 // when direct_attempts is unset (0).
 const DefaultPropagationDirectAttempts = 3
+
+// Propagation sync (/get) defaults and bounds.
+const (
+	DefaultPropagationSyncInterval        = 5 * time.Minute
+	MinPropagationSyncInterval            = 10 * time.Second
+	DefaultPropagationSyncTransferLimitKB = 512
+	// MaxPropagationSyncTransferLimitKB keeps a single /get response
+	// safely below rns.MaxEfficientSize (1024 KiB - 1) after msgpack
+	// list + RPC envelope overhead so SetMaxResourceSegments(1) never
+	// rejects a propagation download.
+	MaxPropagationSyncTransferLimitKB = 960
+	DefaultPropagationSyncMaxMessages = 32
+	DefaultPropagationSyncTimeout     = 2 * time.Minute
+)
 
 // NodeBytes returns the pinned propagation node's destination hash, or
 // nil when no node is pinned. Only valid after Load/normalize.
@@ -538,9 +587,13 @@ func defaults() *Config {
 			PinsOnJoin: true,
 		},
 		Propagation: PropagationConfig{
-			Enabled:        false,
-			Mode:           PropagationModeFallback,
-			DirectAttempts: 3,
+			Enabled:             false,
+			Mode:                PropagationModeFallback,
+			DirectAttempts:      DefaultPropagationDirectAttempts,
+			SyncInterval:        Duration(DefaultPropagationSyncInterval),
+			SyncTransferLimitKB: DefaultPropagationSyncTransferLimitKB,
+			SyncMaxMessages:     DefaultPropagationSyncMaxMessages,
+			SyncTimeout:         Duration(DefaultPropagationSyncTimeout),
 		},
 		Meshtastic: MeshtasticConfig{
 			Enabled:          false,
@@ -675,9 +728,11 @@ func (c *Config) normalize() error {
 	if c.Propagation.Mode == "" {
 		c.Propagation.Mode = PropagationModeFallback
 	}
-	if c.Propagation.Mode != PropagationModeFallback && c.Propagation.Mode != PropagationModeAlways {
-		return fmt.Errorf("propagation.mode must be %q or %q, got %q",
-			PropagationModeFallback, PropagationModeAlways, c.Propagation.Mode)
+	if c.Propagation.Mode != PropagationModeFallback &&
+		c.Propagation.Mode != PropagationModeAlways &&
+		c.Propagation.Mode != PropagationModeReceiveOnly {
+		return fmt.Errorf("propagation.mode must be %q, %q, or %q, got %q",
+			PropagationModeFallback, PropagationModeAlways, PropagationModeReceiveOnly, c.Propagation.Mode)
 	}
 	if c.Propagation.DirectAttempts < 0 {
 		return fmt.Errorf("propagation.direct_attempts must be >= 1 (or unset for the default %d), got %d",
@@ -685,6 +740,38 @@ func (c *Config) normalize() error {
 	}
 	if c.Propagation.DirectAttempts == 0 {
 		c.Propagation.DirectAttempts = DefaultPropagationDirectAttempts
+	}
+	if c.Propagation.SyncInterval.Std() < 0 {
+		return fmt.Errorf("propagation.sync_interval must be >= 0 (0 disables)")
+	}
+	if d := c.Propagation.SyncInterval.Std(); d > 0 && d < MinPropagationSyncInterval {
+		return fmt.Errorf("propagation.sync_interval must be at least %s when enabled (got %s), or 0 to disable",
+			MinPropagationSyncInterval, d)
+	}
+	if c.Propagation.Enabled && c.Propagation.Mode == PropagationModeReceiveOnly && c.Propagation.SyncInterval.Std() == 0 {
+		return fmt.Errorf("propagation.mode %q requires propagation.sync_interval > 0", PropagationModeReceiveOnly)
+	}
+	if c.Propagation.SyncTransferLimitKB < 0 {
+		return fmt.Errorf("propagation.sync_transfer_limit_kb must be >= 0 (0 uses default %d)", DefaultPropagationSyncTransferLimitKB)
+	}
+	if c.Propagation.SyncTransferLimitKB == 0 {
+		c.Propagation.SyncTransferLimitKB = DefaultPropagationSyncTransferLimitKB
+	}
+	if c.Propagation.SyncTransferLimitKB > MaxPropagationSyncTransferLimitKB {
+		return fmt.Errorf("propagation.sync_transfer_limit_kb must be <= %d (single-segment Resource cap), got %d",
+			MaxPropagationSyncTransferLimitKB, c.Propagation.SyncTransferLimitKB)
+	}
+	if c.Propagation.SyncMaxMessages < 0 {
+		return fmt.Errorf("propagation.sync_max_messages must be >= 0 (0 uses default %d)", DefaultPropagationSyncMaxMessages)
+	}
+	if c.Propagation.SyncMaxMessages == 0 {
+		c.Propagation.SyncMaxMessages = DefaultPropagationSyncMaxMessages
+	}
+	if c.Propagation.SyncTimeout.Std() < 0 {
+		return fmt.Errorf("propagation.sync_timeout must be >= 0 (0 uses default %s)", DefaultPropagationSyncTimeout)
+	}
+	if c.Propagation.SyncTimeout.Std() == 0 {
+		c.Propagation.SyncTimeout = Duration(DefaultPropagationSyncTimeout)
 	}
 	c.Propagation.Node = strings.ToLower(strings.TrimSpace(c.Propagation.Node))
 	if c.Propagation.Node != "" {

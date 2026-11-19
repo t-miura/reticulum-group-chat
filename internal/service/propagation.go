@@ -37,8 +37,9 @@ type propagationTracker struct {
 	pinned []byte // nil when auto-discovering
 	now    func() time.Time
 
-	mu    sync.Mutex
-	nodes map[string]*propagationNodeState // dest_hash hex → state
+	mu          sync.Mutex
+	nodes       map[string]*propagationNodeState // dest_hash hex → state
+	onNodeReady func()                           // optional non-blocking wake for inbound sync
 }
 
 type propagationNodeState struct {
@@ -110,10 +111,60 @@ func parsePropagationAnnounceAppData(appData []byte) (*lxmf.PropagationNodeInfo,
 	return lxmf.ParsePropagationNodeAppData(normalized)
 }
 
+// setOnNodeReady registers a non-blocking callback fired when the pinned
+// node announces or an auto-discovered usable node is heard. Used by the
+// inbound propagation syncer to wake early when it was waiting for a node.
+func (t *propagationTracker) setOnNodeReady(fn func()) {
+	t.mu.Lock()
+	t.onNodeReady = fn
+	t.mu.Unlock()
+}
+
+// Seed populates the tracker from persisted announce-cache entries
+// (announces.json) so auto-discovery can resume immediately after a quick
+// restart instead of waiting for the next propagation announce cycle.
+// Entries older than nodeStaleAfter are ignored to preserve freshness.
+func (t *propagationTracker) Seed(entries []*rns.KnownIdentity) int {
+	now := t.now()
+	added := 0
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, e := range entries {
+		if e == nil || len(e.DestHash) != rns.IdentityHashLen || !bytes.Equal(e.NameHash, lxmfPropagationNameHash) {
+			continue
+		}
+		if now.Sub(e.LastSeen) > nodeStaleAfter {
+			continue
+		}
+		info, err := parsePropagationAnnounceAppData(e.AppData)
+		if err != nil {
+			continue
+		}
+		usable, _ := acceptableNode(info)
+		key := hex.EncodeToString(e.DestHash)
+		if _, exists := t.nodes[key]; exists {
+			continue
+		}
+		t.evictStaleLocked(now)
+		t.nodes[key] = &propagationNodeState{
+			destHash:        append([]byte(nil), e.DestHash...),
+			firstHeard:      e.LastSeen,
+			lastHeard:       e.LastSeen,
+			enabled:         info.Enabled,
+			stampCost:       info.StampCost,
+			transferLimitKB: info.PerTransferLimitKB,
+			usable:          usable,
+		}
+		added++
+	}
+	return added
+}
+
 // OnAnnounce parses the §5.8.5 app_data and records the node. Malformed
 // app_data is logged and skipped — a node we can't parse is a node we
 // can't negotiate stamps/limits with, so it is never a send candidate.
 func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
+	isPinned := len(t.pinned) > 0 && bytes.Equal(a.DestHash, t.pinned)
 	info, err := parsePropagationAnnounceAppData(a.AppData)
 	if err != nil {
 		// Debug, not info: unlike the cases below this one has no
@@ -123,6 +174,12 @@ func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
 		// every second would be one log line per second for as long as it
 		// keeps doing so.
 		t.logger.Debugf("propagation: ignoring node %x: %v", a.DestHash[:4], err)
+		// For a pinned node, Transport.known already cached its public key
+		// before OnAnnounce ran, so inbound /get retrieval can still open a
+		// link even if app_data was unparseable.
+		if isPinned {
+			t.notifyNodeReady()
+		}
 		return
 	}
 	key := hex.EncodeToString(a.DestHash)
@@ -147,7 +204,12 @@ func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
 		transferLimitKB: info.PerTransferLimitKB,
 		usable:          usable,
 	}
+	cb := t.onNodeReady
 	t.mu.Unlock()
+
+	if cb != nil && (isPinned || (len(t.pinned) == 0 && usable)) {
+		cb()
+	}
 
 	switch {
 	case prev == nil && !usable:
@@ -160,6 +222,15 @@ func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
 		t.logger.Infof("propagation: node %s now accepting=%v", key[:8], info.Enabled)
 	case prev.usable != usable && !usable:
 		t.logger.Infof("propagation: node %s no longer usable — %s", key[:8], reason)
+	}
+}
+
+func (t *propagationTracker) notifyNodeReady() {
+	t.mu.Lock()
+	cb := t.onNodeReady
+	t.mu.Unlock()
+	if cb != nil {
+		cb()
 	}
 }
 

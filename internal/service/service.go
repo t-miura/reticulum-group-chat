@@ -87,6 +87,12 @@ type Service struct {
 	// mesh is the optional Meshtastic channel bridge (nil when disabled).
 	mesh *meshtastic.Bridge
 
+	// propNodes tracks lxmf.propagation announces (nil when propagation is
+	// disabled). propSync polls the selected node via /get on sync_interval
+	// (nil when propagation or inbound sync is disabled).
+	propNodes *propagationTracker
+	propSync  *propagationSyncer
+
 	logger *logging.Logger
 	now    func() time.Time
 }
@@ -300,14 +306,34 @@ func New(cfg *config.Config) (*Service, error) {
 		dedup:          dedup,
 		instanceUnlock: instanceUnlock,
 		replayLimit:    newReplayLimiter(),
+		propNodes:      propNodes,
 		logger:         logger,
 		now:            time.Now,
+	}
+	if cfg.Propagation.Enabled && cfg.Propagation.SyncInterval.Std() > 0 && propNodes != nil {
+		svc.propSync = newPropagationSyncer(
+			newDeliveryRetriever(delivery, transport),
+			propNodes,
+			r.IsBanned,
+			svc.onLXMFReceived,
+			propagationSyncOptions{
+				Interval:             cfg.Propagation.SyncInterval.Std(),
+				TransferLimitKB:      cfg.Propagation.SyncTransferLimitKB,
+				MaxMessages:          cfg.Propagation.SyncMaxMessages,
+				Timeout:              cfg.Propagation.SyncTimeout.Std(),
+				InboundStampCost:     cfg.Service.InboundStampCost,
+				EnforceInboundStamps: cfg.Service.EnforceInboundStamps,
+			},
+			logger,
+		)
+		propNodes.setOnNodeReady(svc.propSync.NotifyNodeReady)
 	}
 	svc.dispatcher = &commands.Dispatcher{
 		Cfg:                 cfg,
 		Roster:              r,
 		Info:                info,
 		Announce:            svc.announceNow,
+		SyncPropagation:     svc.syncPropagationNow,
 		PathLookup:          svc.pathLookup,
 		OnJoin:              svc.onJoin,
 		OnAdminAdd:          svc.onAdminAdd,
@@ -340,6 +366,11 @@ func New(cfg *config.Config) (*Service, error) {
 		if len(entries) > 0 || dropped > 0 {
 			logger.Infof("announce cache restored: %d entries (dropped %d stale > %s)",
 				len(entries), dropped, announceStoreMaxAge)
+		}
+		if propNodes != nil && len(entries) > 0 {
+			if seeded := propNodes.Seed(entries); seeded > 0 {
+				logger.Infof("propagation: seeded %d fresh node(s) from announce cache", seeded)
+			}
 		}
 	}
 	svc.announcePersist = newAnnouncePersistTap(transport, announceStore, logger)
@@ -410,6 +441,15 @@ func (s *Service) Run(ctx context.Context) error {
 			s.logger.Infof("propagation         : direct_attempts=%d while a node is available (else %d)",
 				s.cfg.Propagation.DirectAttempts, maxDeliveryAttempts)
 		}
+		if s.propSync != nil {
+			s.logger.Infof("propagation sync    : interval=%s transfer_limit=%dKB max_messages=%d timeout=%s",
+				s.cfg.Propagation.SyncInterval.Std(),
+				s.cfg.Propagation.SyncTransferLimitKB,
+				s.cfg.Propagation.SyncMaxMessages,
+				s.cfg.Propagation.SyncTimeout.Std())
+		} else {
+			s.logger.Infof("propagation sync    : disabled (sync_interval=0)")
+		}
 	}
 
 	tCtx, tCancel := context.WithCancel(ctx)
@@ -431,6 +471,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// path-request defer for unknown recipients. Sequential by design
 	// (half-duplex collision resilience).
 	go s.outbound.Run(tCtx)
+
+	if s.propSync != nil {
+		go s.propSync.Run(tCtx)
+	}
 
 	if s.mesh != nil {
 		s.logger.Infof("meshtastic bridge   : #%s (hash=0x%02x node=%s)",
@@ -626,6 +670,19 @@ func (s *Service) announceNow() error {
 	return s.transport.Broadcast(pkt)
 }
 
+// syncPropagationNow is the /sync hook — triggers an immediate inbound
+// propagation retrieval cycle without blocking.
+func (s *Service) syncPropagationNow() string {
+	if !s.cfg.Propagation.Enabled {
+		return "Propagation is not enabled on this service."
+	}
+	if s.propSync == nil {
+		return "Propagation inbound sync is disabled (propagation.sync_interval = 0)."
+	}
+	s.logger.Infof("on-demand /sync")
+	return s.propSync.TriggerSync()
+}
+
 func (s *Service) runPrune(now time.Time) {
 	pruned, err := s.roster.Prune(now, s.cfg.Service.PruneAfter.Std(), s.cfg.Service.PruneSilentAfter.Std())
 	if err != nil {
@@ -750,6 +807,9 @@ func (t *announceTap) OnAnnounce(a *rns.Announce) {
 		t.svc.logger.Warnf("announce update: %v", err)
 	}
 	t.maybeAdoptAnnouncedNickname(a)
+	if t.svc.propSync != nil {
+		t.svc.propSync.OnSenderAnnounce(a.DestHash)
+	}
 }
 
 // maybeAdoptAnnouncedNickname pulls the announced display name into the
@@ -856,13 +916,21 @@ func (s *Service) runRosterFlusher(ctx context.Context) {
 // wedging.
 func (s *Service) pinRosterDestinations() {
 	hashes := s.roster.Hashes()
-	pins := make([][]byte, 0, len(hashes))
+	pins := make([][]byte, 0, len(hashes)+2)
 	for _, h := range hashes {
 		raw, err := hex.DecodeString(h)
 		if err != nil || len(raw) != 16 {
 			continue
 		}
 		pins = append(pins, raw)
+	}
+	if s.propNodes != nil {
+		if cur := s.propNodes.Current(); len(cur) == 16 {
+			pins = append(pins, cur)
+		}
+	}
+	if pinned := s.cfg.Propagation.NodeBytes(); len(pinned) == 16 {
+		pins = append(pins, pinned)
 	}
 	s.transport.PinDestinations(pins)
 }

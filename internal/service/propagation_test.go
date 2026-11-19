@@ -230,3 +230,68 @@ func TestNormalizePropagationAppDataForSendPropagated(t *testing.T) {
 		t.Errorf("unexpected parsed info: %+v", info)
 	}
 }
+
+func TestTrackerSeedRestoresFreshPropagationNodes(t *testing.T) {
+	tr := newTestTracker(nil)
+	base := time.Unix(1700000000, 0)
+	tr.now = func() time.Time { return base }
+
+	fresh := makeKnownIdentity(0xaa, base.Add(-5*time.Minute))
+	fresh.NameHash = lxmfPropagationNameHash
+	fresh.AppData = pnAppData(t, true, 256, 0)
+
+	stale := makeKnownIdentity(0xbb, base.Add(-nodeStaleAfter-time.Minute))
+	stale.NameHash = lxmfPropagationNameHash
+	stale.AppData = pnAppData(t, true, 256, 0)
+
+	deliveryPeer := makeKnownIdentity(0xcc, base.Add(-time.Minute))
+	deliveryPeer.NameHash = lxmfDeliveryNameHash
+
+	added := tr.Seed([]*rns.KnownIdentity{fresh, stale, deliveryPeer})
+	if added != 1 {
+		t.Fatalf("Seed added %d entries, want 1", added)
+	}
+	if got := tr.Current(); !bytes.Equal(got, fresh.DestHash) {
+		t.Errorf("Current() = %x, want seeded fresh node %x", got, fresh.DestHash)
+	}
+}
+
+func TestTrackerOnNodeReadyCallback(t *testing.T) {
+	// Auto-discover mode fires on usable node, not unusable.
+	tr := newTestTracker(nil)
+	calls := 0
+	tr.setOnNodeReady(func() { calls++ })
+
+	tr.OnAnnounce(pnAnnounce(t, 0xaa, false))
+	if calls != 0 {
+		t.Errorf("unusable auto-discovered node fired onNodeReady %d times, want 0", calls)
+	}
+	tr.OnAnnounce(pnAnnounce(t, 0xbb, true))
+	if calls != 1 {
+		t.Errorf("usable auto-discovered node fired onNodeReady %d times, want 1", calls)
+	}
+
+	// Pinned mode fires when the pinned node announces even if accepting=false
+	// or app_data is malformed (public key is still cached for /get).
+	pinned := bytes.Repeat([]byte{0x44}, 16)
+	trPin := newTestTracker(pinned)
+	pinCalls := 0
+	trPin.setOnNodeReady(func() { pinCalls++ })
+
+	trPin.OnAnnounce(pnAnnounce(t, 0x55, true)) // unrelated node
+	if pinCalls != 0 {
+		t.Errorf("non-pinned node fired onNodeReady %d times, want 0", pinCalls)
+	}
+	trPin.OnAnnounce(pnAnnounce(t, 0x44, false))
+	if pinCalls != 1 {
+		t.Errorf("pinned node (accepting=false) fired onNodeReady %d times, want 1", pinCalls)
+	}
+	trPin.OnAnnounce(&rns.Announce{
+		DestHash: pinned,
+		NameHash: lxmfPropagationNameHash,
+		AppData:  []byte{0x01, 0x02},
+	})
+	if pinCalls != 2 {
+		t.Errorf("pinned node (malformed app_data) fired onNodeReady %d times, want 2", pinCalls)
+	}
+}

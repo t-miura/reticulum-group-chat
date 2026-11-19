@@ -152,15 +152,19 @@ messages addressed to a destination hash, deliverable opportunistically
   DATA (one Token-framed packet over a Reticulum Link) for medium
   payloads; SPEC §10 Resource transfer for anything bigger (long
   `/users` replies on big rosters, long chat messages, etc.).
-- **Propagation-node store-and-forward (opt-in, v1.13.0+).** With
+- **Propagation-node store-and-forward (opt-in, bidirectional).** With
   `[propagation] enabled = true`, messages that exhaust their direct
   retry budget are handed to an LXMF propagation node (SPEC §5.8)
   instead of dropped — offline members get them on their client's
-  next sync. Nodes are auto-discovered from `lxmf.propagation`
-  announces (or pinned by hash), the node's declared per-transfer
-  limit is respected, and required §5.7 proof-of-work stamps are
-  ground automatically. `mode = "always"` routes everything via the
-  node. See [`[propagation]`](#propagation).
+  next sync — and `fwdsvc` periodically polls its propagation node via
+  `/get` (SPEC §5.8.3, `sync_interval`, default `5m`) to collect
+  inbound messages sent to the group via propagation. Nodes are
+  auto-discovered from `lxmf.propagation` announces (or pinned by
+  hash), the node's declared per-transfer limit is respected, and
+  required §5.7 proof-of-work stamps are ground automatically.
+  `mode = "always"` routes all outbound mail via the node, and
+  `mode = "receive_only"` keeps outbound direct-only while syncing
+  inbound mail. See [`[propagation]`](#propagation).
 - **Mod / admin moderation.** Config-file `admins` and `mods` lists
   get `/kick`, `/ban`, `/unban`, `/announce`, `/path`, and the
   cross-user form of `/nick`. Admins can also grant/clear roles at
@@ -347,6 +351,7 @@ everything.
 | `/unpin <n>`              | mods, admins | Remove pin `n`, using the number `/pins` prints. |
 | `/setinfo <text>`         | admins       | Set the group description `/info` returns. It must fit, with the display name, in one packet — roughly 280 bytes shared, 256 at most for the description; a refusal tells you the exact room left. No argument clears it. |
 | `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately |
+| `/sync`                   | mods, admins | Trigger an immediate propagation-node `/get` sync round (when `[propagation]` inbound sync is enabled) |
 | `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. The hop count is approximate: peers running RNS ≥ 1.3.7 with the `local_hops_delta` privacy option inflate it by a constant 2–7 (SPEC §2.4). |
 | `/usermode <admin\|mod\|user> <user>` | admins | Grant or clear a runtime role for a roster member — no config edit or restart needed. `admin`/`mod` promote; `user` clears the runtime grant. |
 
@@ -499,15 +504,19 @@ the burst.
 
 ### `[propagation]`
 
-Store-and-forward delivery via LXMF propagation nodes (SPEC §5.8).
-Disabled by default; existing deployments are unaffected.
+Bidirectional store-and-forward delivery and retrieval via LXMF propagation
+nodes (SPEC §5.8). Disabled by default; existing deployments are unaffected.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool   | `false`      | Turn propagation-node submission on. |
-| `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node only after the direct retry budget (5 attempts) is exhausted. `"always"`: every outbound message goes to the propagation node only — nothing is dropped for being offline, at the cost of sync latency. |
-| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). **Most operators should leave this unset** — see [Choosing a propagation node](#choosing-a-propagation-node). Unset = auto-select: among nodes that are accepting and whose announced parameters we can satisfy, the one known longest and heard from recently. |
+| `enabled` | bool   | `false`      | Turn propagation-node support (outbound submission and/or inbound `/get` sync) on. |
+| `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node after the direct retry budget is exhausted. `"always"`: every outbound message goes to the propagation node only. `"receive_only"`: keep outbound sends direct-only and use propagation strictly for inbound `/get` retrieval (requires `sync_interval > 0`). |
+| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). Used for both outbound upload and inbound `/get` sync. **Most operators should leave this unset unless everyone shares a node (or you run your own LXMd)** — see [Choosing a propagation node](#choosing-a-propagation-node). Unset = auto-select: among nodes that are accepting and whose announced parameters we can satisfy, the one known longest and heard from recently. |
 | `direct_attempts` | int | `3` | **Shortens the direct retry budget, but only while a propagation node is available to fall back to** — failing over after 3 attempts (~75 s) instead of the standard 5 (~3.5 min) gets an offline member's mail onto the node sooner. Whenever no node is known, the full 5-attempt budget still applies before a message is dropped. Both numbers are printed at startup. Set to `5` to disable the shortening. Fallback mode only. |
+| `sync_interval` | duration | `"5m"` | How often to poll the propagation node via `/get` (SPEC §5.8.3) for inbound messages addressed to the group. Set to `"0"` to disable inbound retrieval (outbound-only). Minimum `"10s"` when non-zero to avoid triggering `0xf6` throttling on peered nodes. |
+| `sync_transfer_limit_kb` | int | `512` | Per-round `/get` transfer budget in KB (max `960`). Stays below `fwdsvc`'s single-segment Resource limit (~1 MiB) so larger backlogs paginate across rounds instead of being rejected. |
+| `sync_max_messages` | int | `32` | Maximum messages requested per `/get` round. Backlogs larger than this drain across consecutive rounds within a sync cycle. |
+| `sync_timeout` | duration | `"2m"` | Per-request timeout for each `/get` RPC round (list, download, purge). |
 
 ### Choosing a propagation node
 
@@ -992,15 +1001,18 @@ round-trip with a third-party LXMF client.
   message, so an absurd demand is refused outright rather than
   allowed to occupy an outbound worker. Inbound validation is out of
   scope — a stamp we receive is carried through unverified.
-- **Propagation-node submission** (SPEC §5.8, sender side) — packs
-  the propagated wire form (`dest_hash || Token-encrypted body`,
+- **Propagation-node submission and retrieval** (SPEC §5.8, client side) —
+  outbound packs the propagated wire form (`dest_hash || Token-encrypted body`,
   wrapped in the msgpack upload envelope), parses `lxmf.propagation`
-  announce app_data (the strict 7-element §5.8.5 shape, including
-  the `[5]`-as-list interop gotcha), grinds §5.7.2 propagation
-  stamps (1000-round PN workblock) when the node requires them, and
-  uploads over a Link — single link DATA or Resource by size. The
-  server role and `/get` retrieval are out of scope (members'
-  clients fetch their own mail).
+  announce app_data (7- or 8-element shape, including the `[5]`-as-list
+  interop gotcha), grinds §5.7.2 propagation stamps (1000-round PN
+  workblock) when required, and uploads over a Link. Inbound runs the
+  three-round §5.8.3 `/get` exchange (list → download/purge-haves →
+  acknowledge/purge) over an identified Link with configurable sync
+  intervals, pagination within the single-segment Resource cap, unknown-sender
+  path resolution + hold, and full inbound stamp/banlist enforcement. The
+  propagation-node *server* role (storing/peering third-party mail) remains
+  out of scope.
 - **Resource transfer** (SPEC §10) — full sender and receiver. Send:
   link-encrypt the body, slice into raw-ciphertext parts, advertise
   via msgpack ADV, fulfill receiver-driven REQs, validate the
@@ -1118,11 +1130,10 @@ LXMF to run a group-chat hub. Notable gaps:
   the fan-out is worth rate-limiting by other means. Tickets (§5.7.3)
   are supported by the library but not wired up here, so a member has
   no way to earn an exemption from the grind yet.
-- **Propagation: sender side only.** fwdsvc can *submit* messages to
-  a propagation node (see `[propagation]`), but does not act as a
-  propagation node itself and does not retrieve its own inbound mail
-  via `/get` — people messaging the group need the service reachable
-  directly.
+- **Propagation: client side only.** `fwdsvc` both *submits* outbound
+  mail to and *retrieves* its own inbound mail via `/get` from a
+  propagation node (see `[propagation]`), but does not act as a
+  propagation-node server storing or peering third-party mail.
 - **Limited LXMF field support.** `FIELD_IMAGE` (6) and the upstream
   LXMF 1.0.0 message-meta fields — reply-to (`0x30`=48 + `0x31`=49),
   reactions (`FIELD_REACTION 0x40`=64), comments (`0x41`=65), and
